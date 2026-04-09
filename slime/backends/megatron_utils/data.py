@@ -451,6 +451,8 @@ def log_rollout_data(
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
+            elif isinstance(val, (int, float, np.integer, np.floating)):
+                val = float(val)
             else:
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
