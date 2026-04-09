@@ -751,7 +751,6 @@ class RolloutManager:
         if self.args.slime_prefix_tree_merging:
             ptm_metadata = build_prefix_group_metadata(
                 tokens=train_data["tokens"],
-                response_lengths=train_data["response_lengths"],
                 prefix_max_len=self.args.slime_prefix_max_len,
                 min_group_size=self.args.slime_prefix_min_group_size,
             )

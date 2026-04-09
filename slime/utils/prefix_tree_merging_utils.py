@@ -32,22 +32,29 @@ def _as_int_list(tokens: Any) -> list[int]:
     return [int(x) for x in tokens]
 
 
+@dataclass
+class _TrieNode:
+    count: int
+    children: dict[int, "_TrieNode"]
+
+    @staticmethod
+    def new() -> "_TrieNode":
+        return _TrieNode(count=0, children={})
+
+
 def build_prefix_group_metadata(
     tokens: Sequence[Sequence[int] | Any],
-    response_lengths: Sequence[int],
+    effective_lengths: Sequence[int] | None = None,
+    response_lengths: Sequence[int] | None = None,
     prefix_max_len: int | None = None,
     min_group_size: int = 2,
 ) -> dict[str, Any]:
-    """Build per-sample prefix-group metadata from tokenized rollout samples.
+    """Build per-sample PTM metadata from full-sequence prefix-tree matching.
 
-    The prefix is defined as the prompt segment (total_len - response_len),
-    optionally clipped by ``prefix_max_len``.
+    Each sample traverses a trie built from effective token sequences (without
+    right-padding). Its reusable prefix length is the deepest depth whose trie
+    node support count is at least ``min_group_size``.
     """
-
-    if len(tokens) != len(response_lengths):
-        raise ValueError(
-            f"tokens and response_lengths length mismatch: {len(tokens)} vs {len(response_lengths)}"
-        )
 
     n = len(tokens)
     if n == 0:
@@ -62,39 +69,77 @@ def build_prefix_group_metadata(
             "ptm_avg_group_size": 0.0,
         }
 
-    groups_by_key: dict[tuple[int, ...], list[int]] = defaultdict(list)
-    prefix_lens: list[int] = [0] * n
+    if effective_lengths is None and response_lengths is not None:
+        # Backward-compatible fallback.
+        effective_lengths = []
+        for tok, response_len in zip(tokens, response_lengths, strict=True):
+            tok_list = _as_int_list(tok)
+            effective_lengths.append(max(len(tok_list) - int(response_len), 0))
 
-    for i, (tok, response_len) in enumerate(zip(tokens, response_lengths, strict=True)):
+    if effective_lengths is None:
+        effective_lengths = [len(_as_int_list(tok)) for tok in tokens]
+
+    if len(tokens) != len(effective_lengths):
+        raise ValueError(
+            f"tokens and effective_lengths length mismatch: {len(tokens)} vs {len(effective_lengths)}"
+        )
+
+    clipped_sequences: list[list[int]] = []
+    for tok, effective_len in zip(tokens, effective_lengths, strict=True):
         tok_list = _as_int_list(tok)
-        prompt_len = max(len(tok_list) - int(response_len), 0)
-        prefix_len = prompt_len if prefix_max_len is None else min(prompt_len, prefix_max_len)
-        prefix_lens[i] = prefix_len
-        key = tuple(tok_list[:prefix_len]) if prefix_len > 0 else tuple()
-        groups_by_key[key].append(i)
+        capped_effective_len = max(min(int(effective_len), len(tok_list)), 0)
+        cap_len = capped_effective_len if prefix_max_len is None else min(capped_effective_len, int(prefix_max_len))
+        clipped_sequences.append(tok_list[:cap_len])
+
+    root = _TrieNode.new()
+    for seq in clipped_sequences:
+        node = root
+        for token in seq:
+            child = node.children.get(token)
+            if child is None:
+                child = _TrieNode.new()
+                node.children[token] = child
+            child.count += 1
+            node = child
+
+    prefix_lens: list[int] = [0] * n
+    groups_by_key: dict[tuple[int, ...], list[int]] = defaultdict(list)
+    for i, seq in enumerate(clipped_sequences):
+        node = root
+        best_depth = 0
+        for depth, token in enumerate(seq, start=1):
+            child = node.children.get(token)
+            if child is None:
+                break
+            if child.count >= min_group_size:
+                best_depth = depth
+            node = child
+        prefix_lens[i] = best_depth
+        if best_depth > 0:
+            groups_by_key[tuple(seq[:best_depth])].append(i)
 
     group_ids: list[int] = [-1] * n
     group_sizes: list[int] = [1] * n
-    mergeable_group_id = 0
+    mergeable_group_id_by_key: dict[tuple[int, ...], int] = {}
     max_group_size = 0
     mergeable_samples = 0
 
     for key, indices in groups_by_key.items():
         group_size = len(indices)
-        for idx in indices:
-            group_sizes[idx] = group_size
-
         max_group_size = max(max_group_size, group_size)
-        if len(key) == 0 or group_size < min_group_size:
+        if group_size < min_group_size:
             continue
 
+        gid = len(mergeable_group_id_by_key)
+        mergeable_group_id_by_key[key] = gid
         for idx in indices:
-            group_ids[idx] = mergeable_group_id
-        mergeable_group_id += 1
+            group_ids[idx] = gid
+            group_sizes[idx] = group_size
         mergeable_samples += group_size
 
-    num_groups = len(groups_by_key)
-    num_mergeable_groups = mergeable_group_id
+    max_group_size = max(max_group_size, 1 if n > 0 else 0)
+    num_mergeable_groups = len(mergeable_group_id_by_key)
+    num_groups = num_mergeable_groups + (n - mergeable_samples)
     avg_group_size = (mergeable_samples / num_mergeable_groups) if num_mergeable_groups > 0 else 0.0
 
     return {
@@ -116,7 +161,7 @@ def build_prefix_tree_context_from_rollout_data(
     """Build local-rank PTM context from rollout_data.
 
     Prefers precomputed metadata in rollout_data. If absent, it computes from
-    local tokens and response lengths as fallback.
+    local tokens and effective lengths as fallback.
     """
 
     group_ids = rollout_data.get("ptm_group_ids")
@@ -124,10 +169,10 @@ def build_prefix_tree_context_from_rollout_data(
 
     if group_ids is None or prefix_lens is None:
         tokens = rollout_data.get("tokens")
-        response_lengths = rollout_data.get("response_lengths")
-        if tokens is None or response_lengths is None:
+        effective_lengths = rollout_data.get("total_lengths")
+        if tokens is None:
             return None
-        fallback = build_prefix_group_metadata(tokens, response_lengths, min_group_size=min_group_size)
+        fallback = build_prefix_group_metadata(tokens, effective_lengths=effective_lengths, min_group_size=min_group_size)
         group_ids = fallback["ptm_group_ids"]
         prefix_lens = fallback["ptm_prefix_lens"]
 
