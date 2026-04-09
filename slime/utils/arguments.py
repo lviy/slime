@@ -259,6 +259,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--rollout-top-k", type=int, default=-1, help="the top-k for the inference engine during rollout."
             )
             parser.add_argument(
+                "--rollout-repetition-penalty",
+                type=float,
+                default=1.0,
+                help="the repetition penalty for the inference engine during rollout.",
+            )
+            parser.add_argument(
                 "--rollout-max-context-len",
                 type=int,
                 default=None,
