@@ -24,6 +24,7 @@ from megatron.training.training import get_model
 
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.prefix_tree_merging_utils import PrefixTreeMergingContext, log_prefix_tree_context
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
@@ -157,6 +158,8 @@ def forward_only(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     store_prefix: str = "",
+    prefix_tree_context: PrefixTreeMergingContext | None = None,
+    prefix_tree_stage: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -186,6 +189,7 @@ def forward_only(
         iterator.reset()
 
     config = get_model_config(model[0])
+    prefix_tree_log_emitted = False
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -201,6 +205,8 @@ def forward_only(
             Output tensor(s) and a callable that computes and packages results
             to be collected by the engine.
         """
+
+        nonlocal prefix_tree_log_emitted
 
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
 
@@ -235,6 +241,18 @@ def forward_only(
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
         output_tensor = model(**forward_kwargs)
+
+        if prefix_tree_context is not None and not prefix_tree_log_emitted:
+            log_prefix_tree_context(
+                stage=prefix_tree_stage or (f"{store_prefix}logprobs"),
+                context=prefix_tree_context,
+                extra={
+                    "tokens_shape": tuple(tokens.shape),
+                    "micro_batch_samples": len(unconcat_tokens),
+                    "qkv_format": args.qkv_format,
+                },
+            )
+            prefix_tree_log_emitted = True
 
         return output_tensor, partial(
             f,

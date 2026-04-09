@@ -20,6 +20,7 @@ from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
+from slime.utils.prefix_tree_merging_utils import build_prefix_tree_context_from_rollout_data, log_prefix_tree_context
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
@@ -348,6 +349,8 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator: list[DataIterator],
         num_microbatches: list[int],
         store_prefix: str = "",
+        prefix_tree_context=None,
+        prefix_tree_stage: str | None = None,
     ) -> dict[str, list[torch.Tensor]]:
 
         with timer(f"{store_prefix}log_probs"):
@@ -358,6 +361,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_iterator,
                 num_microbatches,
                 store_prefix=store_prefix,
+                prefix_tree_context=prefix_tree_context,
+                prefix_tree_stage=prefix_tree_stage,
             )
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
@@ -411,6 +416,14 @@ class MegatronTrainRayActor(TrainRayActor):
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
+            prefix_tree_context = None
+            if self.args.slime_prefix_tree_merging:
+                prefix_tree_context = build_prefix_tree_context_from_rollout_data(
+                    rollout_data, min_group_size=self.args.slime_prefix_min_group_size
+                )
+                if prefix_tree_context is not None and is_megatron_main_rank():
+                    log_prefix_tree_context("train_actor_build", prefix_tree_context)
+
             if self.args.compute_advantages_and_returns:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
@@ -421,6 +434,8 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             store_prefix="ref_",
+                            prefix_tree_context=prefix_tree_context,
+                            prefix_tree_stage="ref-logprobs",
                         )
                     )
 
@@ -434,6 +449,8 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             store_prefix="teacher_",
+                            prefix_tree_context=prefix_tree_context,
+                            prefix_tree_stage="teacher-logprobs",
                         )
                     )
 
@@ -449,6 +466,8 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             store_prefix="",
+                            prefix_tree_context=prefix_tree_context,
+                            prefix_tree_stage="actor-logprobs",
                         )
                     )
                     if self.args.use_rollout_routing_replay:

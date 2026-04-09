@@ -22,6 +22,7 @@ from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
+from slime.utils.prefix_tree_merging_utils import build_prefix_group_metadata
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
@@ -747,6 +748,24 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if self.args.slime_prefix_tree_merging:
+            ptm_metadata = build_prefix_group_metadata(
+                tokens=train_data["tokens"],
+                response_lengths=train_data["response_lengths"],
+                prefix_max_len=self.args.slime_prefix_max_len,
+                min_group_size=self.args.slime_prefix_min_group_size,
+            )
+            train_data.update(ptm_metadata)
+            logger.info(
+                "[PTM] rollout metadata: num_groups=%s, num_mergeable_groups=%s, "
+                "num_mergeable_samples=%s, max_group_size=%s, avg_group_size=%.2f",
+                ptm_metadata["ptm_num_groups"],
+                ptm_metadata["ptm_num_mergeable_groups"],
+                ptm_metadata["ptm_num_mergeable_samples"],
+                ptm_metadata["ptm_max_group_size"],
+                ptm_metadata["ptm_avg_group_size"],
+            )
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -786,6 +805,9 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "ptm_group_ids",
+                "ptm_prefix_lens",
+                "ptm_group_sizes",
             ]:
                 if key not in data:
                     continue
@@ -795,6 +817,11 @@ class RolloutManager:
             for key in [
                 "raw_reward",
                 "total_lengths",
+                "ptm_num_groups",
+                "ptm_num_mergeable_groups",
+                "ptm_num_mergeable_samples",
+                "ptm_max_group_size",
+                "ptm_avg_group_size",
             ]:
                 if key not in data:
                     continue

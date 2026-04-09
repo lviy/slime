@@ -882,6 +882,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--slime-prefix-tree-merging",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable Slime-side Prefix Tree Merging wiring in no-grad logprob path. "
+                    "This stage only builds and propagates prefix-group metadata."
+                ),
+            )
+            parser.add_argument(
+                "--slime-prefix-max-len",
+                type=int,
+                default=None,
+                help=(
+                    "Optional cap on prefix length used for Slime-side prefix grouping. "
+                    "If not set, the full prompt length is used."
+                ),
+            )
+            parser.add_argument(
+                "--slime-prefix-min-group-size",
+                type=int,
+                default=2,
+                help="Minimum group size to mark a prefix group as mergeable.",
+            )
+            parser.add_argument(
                 "--get-mismatch-metrics",
                 action="store_true",
                 default=False,
@@ -1610,6 +1634,14 @@ def slime_validate_args(args):
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
+
+    if args.slime_prefix_tree_merging:
+        if args.train_backend != "megatron":
+            raise ValueError("--slime-prefix-tree-merging currently supports --train-backend megatron only.")
+        if args.slime_prefix_max_len is not None and args.slime_prefix_max_len <= 0:
+            raise ValueError("--slime-prefix-max-len must be > 0 when set.")
+        if args.slime_prefix_min_group_size < 2:
+            raise ValueError("--slime-prefix-min-group-size must be >= 2.")
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
