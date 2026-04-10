@@ -28,7 +28,8 @@ SGLANG_ROOT = os.environ.get("SLIME_PTM_E2E_SGLANG_ROOT", "/gfs/platform/public/
 SGLANG_PYTHON_PATH = os.environ.get("SLIME_PTM_E2E_SGLANG_PYTHON_PATH", f"{SGLANG_ROOT}/python")
 MEGATRON_PATH = os.environ.get("SLIME_PTM_E2E_MEGATRON_PATH", "/root/Megatron-LM")
 RUNTIME_PYTHONPATH = os.environ.get("SLIME_PTM_E2E_PYTHONPATH", f"{SGLANG_PYTHON_PATH}:{MEGATRON_PATH}")
-NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", "8"))
+_DETECTED_CUDA_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
+NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", str(max(_DETECTED_CUDA_GPUS, 1))))
 NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
 
 COMPARE_KEYS = tuple(
@@ -50,6 +51,23 @@ def prepare() -> None:
     else:
         U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir {MODEL_PATH}")
     U.hf_download_dataset("zhuzilin/gsm8k")
+
+
+def _validate_runtime_gpus() -> None:
+    if _DETECTED_CUDA_GPUS <= 0:
+        raise RuntimeError(
+            "No CUDA GPU detected in current process. "
+            "Please run in a GPU environment or set SLIME_PTM_E2E_NUM_GPUS explicitly after checking device visibility."
+        )
+    if NUM_GPUS > _DETECTED_CUDA_GPUS:
+        raise RuntimeError(
+            f"Configured NUM_GPUS={NUM_GPUS} is larger than detected CUDA GPUs={_DETECTED_CUDA_GPUS}. "
+            "Set SLIME_PTM_E2E_NUM_GPUS to a valid value (for example, the count from `nvidia-smi -L | wc -l`)."
+        )
+    print(
+        f"PTM E2E runtime config: detected_cuda_gpus={_DETECTED_CUDA_GPUS}, "
+        f"num_gpus={NUM_GPUS}, model_path={MODEL_PATH}"
+    )
 
 
 def _runtime_env_vars() -> dict[str, str]:
@@ -125,6 +143,7 @@ def execute_rollout_only(debug_data_dir: str) -> None:
     # Generate rollout files once. Keep this phase PTM-off so that PTM ON train
     # path validates fallback metadata construction from fixed rollout tokens.
     sglang_args = (
+        f"--rollout-num-gpus {NUM_GPUS} "
         "--rollout-num-gpus-per-engine 1 "
         f"--sglang-mem-fraction-static {0.6 if TIGHT_DEVICE_MEMORY else 0.7} "
         "--sglang-cuda-graph-max-bs 32 "
@@ -279,6 +298,7 @@ def compare_no_grad_outputs(debug_data_dir: str) -> None:
 
 
 def execute() -> None:
+    _validate_runtime_gpus()
     debug_data_dir = tempfile.mkdtemp(prefix="slime_ptm_nograd_e2e_")
     print(f"Using temp dir: {debug_data_dir}")
 

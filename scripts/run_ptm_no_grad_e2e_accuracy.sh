@@ -13,4 +13,13 @@ done
 export SLIME_PTM_E2E_SGLANG_ROOT="${SLIME_PTM_E2E_SGLANG_ROOT:-/gfs/platform/public/infra/lxr/sglang}"
 export SLIME_PTM_E2E_SGLANG_PYTHON_PATH="${SLIME_PTM_E2E_SGLANG_PYTHON_PATH:-${SLIME_PTM_E2E_SGLANG_ROOT}/python}"
 
+if [[ -z "${SLIME_PTM_E2E_NUM_GPUS:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    _detected_gpus="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ -n "${_detected_gpus}" && "${_detected_gpus}" -gt 0 ]]; then
+      export SLIME_PTM_E2E_NUM_GPUS="${_detected_gpus}"
+    fi
+  fi
+fi
+
 python3 tests/test_qwen2.5_0.5B_ptm_no_grad_e2e_accuracy.py "$@"
