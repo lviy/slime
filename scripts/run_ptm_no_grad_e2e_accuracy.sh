@@ -10,4 +10,7 @@ for proxy_var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
   unset "${proxy_var}" || true
 done
 
+export SLIME_PTM_E2E_SGLANG_ROOT="${SLIME_PTM_E2E_SGLANG_ROOT:-/gfs/platform/public/infra/lxr/sglang}"
+export SLIME_PTM_E2E_SGLANG_PYTHON_PATH="${SLIME_PTM_E2E_SGLANG_PYTHON_PATH:-${SLIME_PTM_E2E_SGLANG_ROOT}/python}"
+
 python3 tests/test_qwen2.5_0.5B_ptm_no_grad_e2e_accuracy.py "$@"

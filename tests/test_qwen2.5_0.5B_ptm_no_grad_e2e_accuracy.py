@@ -24,6 +24,10 @@ MODEL_NAME = "Qwen2.5-0.5B-Instruct"
 MODEL_TYPE = "qwen2.5-0.5B"
 MODEL_ROOT = os.environ.get("SLIME_PTM_E2E_MODEL_ROOT", "/root/models")
 MODEL_PATH = os.environ.get("SLIME_PTM_E2E_MODEL_PATH", f"{MODEL_ROOT}/{MODEL_NAME}")
+SGLANG_ROOT = os.environ.get("SLIME_PTM_E2E_SGLANG_ROOT", "/gfs/platform/public/infra/lxr/sglang")
+SGLANG_PYTHON_PATH = os.environ.get("SLIME_PTM_E2E_SGLANG_PYTHON_PATH", f"{SGLANG_ROOT}/python")
+MEGATRON_PATH = os.environ.get("SLIME_PTM_E2E_MEGATRON_PATH", "/root/Megatron-LM")
+RUNTIME_PYTHONPATH = os.environ.get("SLIME_PTM_E2E_PYTHONPATH", f"{SGLANG_PYTHON_PATH}:{MEGATRON_PATH}")
 NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", "8"))
 NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
 
@@ -46,6 +50,12 @@ def prepare() -> None:
     else:
         U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir {MODEL_PATH}")
     U.hf_download_dataset("zhuzilin/gsm8k")
+
+
+def _runtime_env_vars() -> dict[str, str]:
+    return {
+        "PYTHONPATH": RUNTIME_PYTHONPATH,
+    }
 
 
 def _common_args() -> str:
@@ -132,6 +142,7 @@ def execute_rollout_only(debug_data_dir: str) -> None:
         train_args=phase_args,
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
+        extra_env_vars=_runtime_env_vars(),
     )
 
 
@@ -152,6 +163,7 @@ def execute_train_only(debug_data_dir: str, *, ptm_enabled: bool, tag: str) -> N
         train_args=phase_args,
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
+        extra_env_vars=_runtime_env_vars(),
     )
 
 
