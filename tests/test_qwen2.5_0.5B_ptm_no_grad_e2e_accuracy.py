@@ -22,6 +22,8 @@ TIGHT_DEVICE_MEMORY = U.get_bool_env_var("SLIME_TEST_TIGHT_DEVICE_MEMORY", "1")
 
 MODEL_NAME = "Qwen2.5-0.5B-Instruct"
 MODEL_TYPE = "qwen2.5-0.5B"
+MODEL_ROOT = os.environ.get("SLIME_PTM_E2E_MODEL_ROOT", "/root/models")
+MODEL_PATH = f"{MODEL_ROOT}/{MODEL_NAME}"
 NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", "8"))
 NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
 
@@ -37,13 +39,13 @@ PTM_PREFIX_MAX_LEN = os.environ.get("SLIME_PTM_E2E_PREFIX_MAX_LEN")
 
 
 def prepare() -> None:
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U.exec_command(f"mkdir -p {MODEL_ROOT} /root/datasets")
+    U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir {MODEL_PATH}")
     U.hf_download_dataset("zhuzilin/gsm8k")
 
 
 def _common_args() -> str:
-    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
+    ckpt_args = f"--hf-checkpoint {MODEL_PATH}/ " f"--ref-load {MODEL_PATH}/ "
 
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
