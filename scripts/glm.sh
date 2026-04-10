@@ -92,6 +92,8 @@ echo "✅ Model will be saved to: ${model_save_path}"
 
 export TENSORBOARD_DIR=${model_save_path}
 export LOG_FILE=${LOG_ROOT_DIR}/train_log_$(date +%Y-%m-%d_%H-%M-%S).log
+export DEBUG_DUMP_DIR=${DEBUG_DUMP_DIR:-"${model_save_path}/debug"}
+mkdir -p "${DEBUG_DUMP_DIR}"
 
 if [ ! -d "$model_save_path" ]; then
    mkdir -p "$model_save_path"
@@ -102,8 +104,8 @@ fi
 
 export save_interval=${save_interval:-4}
 
-export val_data_path="/gfs/space/chatrl/users/hxh/data/rule_based_rl/AIME-2024/data/AIME_DAPO_math.jsonl"
-export train_data_path="/gfs/space/chatrl/users/hxh/data/rule_based_rl/DAPO-Math-17k/data/dapo-math-17k_dedup.jsonl"
+export val_data_path=${val_data_path:-"/gfs/space/chatrl/users/hxh/data/rule_based_rl/AIME-2024/data/AIME_DAPO_math.jsonl"}
+export train_data_path=${train_data_path:-"/gfs/space/chatrl/users/hxh/data/rule_based_rl/DAPO-Math-17k/data/dapo-math-17k_dedup.jsonl"}
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -218,6 +220,22 @@ MISC_ARGS=(
    --moe-token-dispatcher-type alltoall
 )
 
+PTM_ARGS=()
+_ptm_enable=$(echo "${PTM_ENABLE:-0}" | tr '[:upper:]' '[:lower:]')
+if [[ "${_ptm_enable}" == "1" || "${_ptm_enable}" == "true" || "${_ptm_enable}" == "yes" ]]; then
+   PTM_ARGS+=(--slime-prefix-tree-merging)
+   PTM_ARGS+=(--slime-prefix-min-group-size "${PTM_MIN_GROUP_SIZE:-2}")
+   if [[ -n "${PTM_PREFIX_MAX_LEN:-}" ]]; then
+      PTM_ARGS+=(--slime-prefix-max-len "${PTM_PREFIX_MAX_LEN}")
+   fi
+fi
+
+EXTRA_TRAIN_ARGS_ARRAY=()
+if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
+   # shellcheck disable=SC2206
+   EXTRA_TRAIN_ARGS_ARRAY=(${EXTRA_TRAIN_ARGS})
+fi
+
 export WORLD_SIZE=${ACTOR_NUM_NODES}
 export MASTER_ADDR=${GEMINI_IP_taskrole1_0:-"127.0.0.1"}
 export RANK=${GEMINI_TASK_INDEX:-0}
@@ -259,7 +277,8 @@ if [ "$RANK" -eq 0 ]; then
       --rollout-health-check-interval 10 \
       --rollout-health-check-timeout 30 \
       --rollout-health-check-first-wait 300 \
-      --save-debug-rollout-data ${model_save_path}/exp2_rollout_{rollout_id}.pt \
+      --save-debug-rollout-data ${DEBUG_DUMP_DIR}/rollout_{rollout_id}.pt \
+      --save-debug-train-data ${DEBUG_DUMP_DIR}/train_{rollout_id}_{rank}.pt \
       ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \
@@ -270,13 +289,14 @@ if [ "$RANK" -eq 0 ]; then
       ${EVAL_ARGS[@]} \
       ${SGLANG_ARGS[@]} \
       ${MISC_ARGS[@]} \
+      ${PTM_ARGS[@]} \
+      ${EXTRA_TRAIN_ARGS_ARRAY[@]} \
       2>&1 | tee "${LOG_FILE}"
 
 else
    # 对于其余节点，加入 Ray worker 集群
    ray start --address="${MASTER_ADDR}:6379" --num-gpus 2 --disable-usage-stats --block
 fi
-
 
 
 
