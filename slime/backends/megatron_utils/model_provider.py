@@ -17,6 +17,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from slime.utils.hf_compat import patch_qwen2_rope_theta_compat
 from slime.utils.misc import load_function
 
 
@@ -81,6 +82,7 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
+        patch_qwen2_rope_theta_compat()
         from megatron.bridge import AutoBridge
 
         import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges

@@ -23,6 +23,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from slime.utils import logging_utils
+from slime.utils.hf_compat import patch_qwen2_rope_theta_compat
 from slime.utils.memory_utils import clear_memory
 from slime.utils.prefix_tree_merging_utils import PrefixTreeMergingContext, log_prefix_tree_context
 
@@ -746,6 +747,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
     )
 
     try:
+        patch_qwen2_rope_theta_compat()
         from megatron.bridge import AutoBridge
 
         from slime.utils.megatron_bridge_utils import patch_megatron_model

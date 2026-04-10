@@ -8,6 +8,7 @@ from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args
 
+from slime.utils.hf_compat import patch_qwen2_rope_theta_compat
 from slime.utils import megatron_bridge_utils
 
 try:
@@ -128,6 +129,7 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
+    patch_qwen2_rope_theta_compat()
     from megatron.bridge import AutoBridge
 
     import slime_plugins.megatron_bridge  # noqa: F401

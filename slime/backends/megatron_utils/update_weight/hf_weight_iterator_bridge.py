@@ -1,6 +1,7 @@
 import dataclasses
 
 
+from slime.utils.hf_compat import patch_qwen2_rope_theta_compat
 from slime.utils import megatron_bridge_utils
 from slime.utils.misc import chunk_named_params_by_size
 
@@ -40,6 +41,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        patch_qwen2_rope_theta_compat()
         from megatron.bridge import AutoBridge
 
         import slime_plugins.megatron_bridge  # noqa: F401
