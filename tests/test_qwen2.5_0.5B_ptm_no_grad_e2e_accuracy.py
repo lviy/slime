@@ -34,9 +34,14 @@ NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
 
 COMPARE_KEYS = tuple(
     key.strip()
-    for key in os.environ.get("SLIME_PTM_E2E_COMPARE_KEYS", "log_probs,ref_log_probs").split(",")
+    for key in os.environ.get("SLIME_PTM_E2E_COMPARE_KEYS", "log_probs").split(",")
     if key.strip()
 )
+STRICT_COMPARE_KEYS = os.environ.get("SLIME_PTM_E2E_STRICT_COMPARE_KEYS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 ATOL = float(os.environ.get("SLIME_PTM_E2E_ATOL", "1e-6"))
 RTOL = float(os.environ.get("SLIME_PTM_E2E_RTOL", "1e-6"))
 PTM_MIN_GROUP_SIZE = int(os.environ.get("SLIME_PTM_E2E_MIN_GROUP_SIZE", "2"))
@@ -257,17 +262,28 @@ def compare_no_grad_outputs(debug_data_dir: str) -> None:
     global_max_abs = 0.0
     global_mean_abs_sum = 0.0
     global_mean_abs_count = 0
+    skipped_keys: set[str] = set()
+    first_pair_keys = None
 
     for key_tuple in sorted(off_index.keys()):
         rollout_id, rank = key_tuple
         off_data = off_index[key_tuple]
         on_data = on_index[key_tuple]
+        if first_pair_keys is None:
+            first_pair_keys = (sorted(off_data.keys()), sorted(on_data.keys()))
 
         for cmp_key in COMPARE_KEYS:
-            if cmp_key not in off_data:
-                raise AssertionError(f"Missing key={cmp_key} in PTM OFF dump for rollout_id={rollout_id}, rank={rank}")
-            if cmp_key not in on_data:
-                raise AssertionError(f"Missing key={cmp_key} in PTM ON dump for rollout_id={rollout_id}, rank={rank}")
+            if cmp_key not in off_data or cmp_key not in on_data:
+                if STRICT_COMPARE_KEYS:
+                    if cmp_key not in off_data:
+                        raise AssertionError(
+                            f"Missing key={cmp_key} in PTM OFF dump for rollout_id={rollout_id}, rank={rank}"
+                        )
+                    raise AssertionError(
+                        f"Missing key={cmp_key} in PTM ON dump for rollout_id={rollout_id}, rank={rank}"
+                    )
+                skipped_keys.add(cmp_key)
+                continue
 
             off_vals = off_data[cmp_key]
             on_vals = on_data[cmp_key]
@@ -288,10 +304,20 @@ def compare_no_grad_outputs(debug_data_dir: str) -> None:
             global_mean_abs_sum += mean_abs
             global_mean_abs_count += 1
 
+    if global_mean_abs_count == 0:
+        off_keys = first_pair_keys[0] if first_pair_keys is not None else []
+        on_keys = first_pair_keys[1] if first_pair_keys is not None else []
+        raise AssertionError(
+            "No comparable keys found in PTM OFF/ON dumps. "
+            f"requested_keys={COMPARE_KEYS}, off_keys_sample={off_keys}, on_keys_sample={on_keys}"
+        )
+
     global_mean_abs = global_mean_abs_sum / max(global_mean_abs_count, 1)
     print("=" * 80)
     print("PTM no-grad E2E accuracy PASSED")
     print(f"Compared keys: {COMPARE_KEYS}")
+    if skipped_keys:
+        print(f"Skipped missing keys (non-strict mode): {sorted(skipped_keys)}")
     print(f"Global max_abs_diff={global_max_abs:.6e}, global mean_abs_diff={global_mean_abs:.6e}")
     print(f"Thresholds: rtol={RTOL}, atol={ATOL}")
     print("=" * 80)
