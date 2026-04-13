@@ -13,6 +13,7 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
+from slime.utils.prefix_tree_merging_utils import build_prefix_tree_batch_plan, get_prefix_tree_runtime_trie_manager
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
 
@@ -28,6 +29,7 @@ def get_batch(
     pad_multiplier: int = 128,
     qkv_format: str = "thd",
     allgather_cp: bool = False,
+    enable_prefix_tree_merging: bool = False,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -36,12 +38,14 @@ def get_batch(
     - Fetch raw fields via iterator.
     - Save original token tensors under "unconcat_tokens".
     - Slice tokens into two chunks for Context Parallelism (CP), concatenate, and pad to a configurable multiple.
+    - Optionally run PTM trie merge (experimental): build merged token stream and TreeMask metadata.
     - Build cu_seqlens and `PackedSeqParams` with T-H-D layout (T: sequence length, H: attention heads, D: head dimension).
 
     Args:
         data_iterator: Iterator providing micro-batch data.
         keys: List of keys to fetch from the iterator.
         pad_multiplier: Multiplier for padding size calculation (default: 128).
+        enable_prefix_tree_merging: Whether to enable PTM token merge + TreeMask metadata path.
 
     Returns a dict including:
     - "tokens": torch.LongTensor of shape [1, T_padded] on the current CUDA device
@@ -66,6 +70,8 @@ def get_batch(
 
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
+    ptm_applied = False
+    pad = 0
 
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
@@ -75,7 +81,48 @@ def get_batch(
         packed_seq_params = None
 
     elif qkv_format == "thd":
-        if allgather_cp:
+        enable_ptm_now = enable_prefix_tree_merging and not allgather_cp and cp_size == 1
+        if enable_ptm_now:
+            ptm_plan = build_prefix_tree_batch_plan(tokens)
+            if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
+                device = tokens[0].device
+                dtype = tokens[0].dtype
+                merged_tokens = torch.tensor(ptm_plan.merged_tokens, dtype=dtype, device=device)
+                cu_seqlens = torch.tensor(
+                    [0, merged_tokens.size(0)], dtype=torch.int, device=torch.cuda.current_device()
+                )
+                max_seqlen = merged_tokens.size(0)
+                packed_seq_params = PackedSeqParams(
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_kv=max_seqlen,
+                    qkv_format="thd",
+                    ptm_q_ranges=torch.tensor(
+                        ptm_plan.q_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                    ),
+                    ptm_k_ranges=torch.tensor(
+                        ptm_plan.k_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                    ),
+                    ptm_attn_type_map=torch.tensor(
+                        ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
+                    ),
+                )
+                tokens = merged_tokens.unsqueeze(0)
+                batch["ptm_unmerge_index"] = torch.tensor(
+                    ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
+                )
+                batch["ptm_runtime_stats"] = {
+                    "num_input_tokens": ptm_plan.num_input_tokens,
+                    "num_merged_tokens": ptm_plan.num_merged_tokens,
+                    "matched_prefix_lens": ptm_plan.matched_prefix_lens,
+                    "num_seen_sequences": get_prefix_tree_runtime_trie_manager().num_observed_sequences,
+                }
+                ptm_applied = True
+
+        if ptm_applied:
+            pass
+        elif allgather_cp:
             # DSA mode: concatenate all sequences first, then slice once with CP.
             # We also pad the *global* concatenated stream to make per-rank chunks equal.
             cu_seqlens_list: list[int] = [0]
@@ -112,16 +159,16 @@ def get_batch(
             # thd requires the cu_seqlens to be of the origin length
             cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        packed_seq_params = PackedSeqParams(
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
-            qkv_format="thd",
-        )
-
-        tokens = tokens.unsqueeze(0)
+        if not ptm_applied:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen,
+                qkv_format="thd",
+            )
+            tokens = tokens.unsqueeze(0)
     else:
         raise ValueError(f"Unsupported qkv_format: {qkv_format}")
 
@@ -129,33 +176,37 @@ def get_batch(
     batch["packed_seq_params"] = packed_seq_params
 
     # loss masks
-    loss_masks = []
-    for loss_mask, total_length, response_length in zip(
-        batch["loss_masks"],
-        batch["total_lengths"],
-        batch["response_lengths"],
-        strict=True,
-    ):
-        prompt_length = total_length - response_length
-        # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
-        loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
-        if allgather_cp:
+    if ptm_applied:
+        # PTM no-grad path currently does not consume token-level loss masks.
+        loss_masks = torch.ones_like(tokens, dtype=torch.float32)
+    else:
+        loss_masks = []
+        for loss_mask, total_length, response_length in zip(
+            batch["loss_masks"],
+            batch["total_lengths"],
+            batch["response_lengths"],
+            strict=True,
+        ):
+            prompt_length = total_length - response_length
+            # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
+            loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
+            if allgather_cp:
+                loss_masks.append(loss_mask)
+                continue
+            loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
             loss_masks.append(loss_mask)
-            continue
-        loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
-        loss_masks.append(loss_mask)
 
-    if qkv_format == "bshd":
-        loss_masks = torch.stack(loss_masks)
-    elif qkv_format == "thd" and allgather_cp:
-        # DSA: concatenate first (same as tokens), pad globally (same pad as above), then slice once.
-        loss_masks = torch.cat(loss_masks, dim=0)
-        if pad != 0:
-            loss_masks = F.pad(loss_masks, (0, pad), value=0)
-        loss_masks = loss_masks.chunk(cp_size, dim=0)[cp_rank].unsqueeze(0)
-    elif qkv_format == "thd":
-        loss_masks = torch.cat(loss_masks)
-        loss_masks = F.pad(loss_masks, (0, pad), value=0).unsqueeze(0)
+        if qkv_format == "bshd":
+            loss_masks = torch.stack(loss_masks)
+        elif qkv_format == "thd" and allgather_cp:
+            # DSA: concatenate first (same as tokens), pad globally (same pad as above), then slice once.
+            loss_masks = torch.cat(loss_masks, dim=0)
+            if pad != 0:
+                loss_masks = F.pad(loss_masks, (0, pad), value=0)
+            loss_masks = loss_masks.chunk(cp_size, dim=0)[cp_rank].unsqueeze(0)
+        elif qkv_format == "thd":
+            loss_masks = torch.cat(loss_masks)
+            loss_masks = F.pad(loss_masks, (0, pad), value=0).unsqueeze(0)
 
     assert loss_masks.shape == tokens.shape, f"loss_masks.shape: {loss_masks.shape}, tokens.shape: {tokens.shape}"
     batch["full_loss_masks"] = loss_masks
@@ -291,11 +342,14 @@ def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
+    force_single_sample_microbatch: bool = False,
 ) -> tuple[list[DataIterator], list[int]]:
     """
     Create iterators and a micro-batch schedule for a rollout step.
 
-    - If `use_dynamic_batch_size` is False, splits into fixed-size contiguous
+    - If `force_single_sample_microbatch` is True, each sample is assigned to its own
+      micro-batch (primarily for no-grad logprob debugging/prototyping).
+    - Else if `use_dynamic_batch_size` is False, splits into fixed-size contiguous
       micro-batches of `micro_batch_size`.
     - If True, computes the number of micro-batches per local step based on
       `max_tokens_per_gpu` and per-sample lengths, all-reduces to a DP-wide
@@ -335,7 +389,16 @@ def get_data_iterator(
             data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
         return data_iterator
 
-    if not args.use_dynamic_batch_size:
+    if force_single_sample_microbatch:
+        if vpp_size > 1:
+            raise ValueError("force_single_sample_microbatch does not support virtual pipeline parallelism yet.")
+        num_microbatches = [num_local_gbs for _ in range(num_steps_per_rollout)]
+        micro_batch_indices = []
+        for i in range(num_steps_per_rollout):
+            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+            micro_batch_indices.extend([[sample_idx] for sample_idx in range(start, end)])
+        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
+    elif not args.use_dynamic_batch_size:
         num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
         data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
     else:

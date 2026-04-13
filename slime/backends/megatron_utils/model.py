@@ -210,6 +210,11 @@ def forward_only(
         nonlocal prefix_tree_log_emitted
 
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
+        enable_ptm_runtime = bool(
+            getattr(args, "slime_prefix_magi_attention", False)
+            and prefix_tree_context is not None
+            and prefix_tree_context.enabled
+        )
 
         # Get the batch.
         batch = get_batch(
@@ -225,6 +230,7 @@ def forward_only(
             args.data_pad_size_multiplier,
             args.qkv_format,
             args.allgather_cp,
+            enable_prefix_tree_merging=enable_ptm_runtime,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -242,16 +248,29 @@ def forward_only(
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
         output_tensor = model(**forward_kwargs)
+        ptm_unmerge_index = batch.get("ptm_unmerge_index")
+        if ptm_unmerge_index is not None and isinstance(output_tensor, torch.Tensor):
+            # Recover logits layout expected by existing per-sample response slicing.
+            output_tensor = output_tensor.index_select(1, ptm_unmerge_index)
 
         if prefix_tree_context is not None and not prefix_tree_log_emitted:
+            extra = {
+                "tokens_shape": tuple(tokens.shape),
+                "micro_batch_samples": len(unconcat_tokens),
+                "qkv_format": args.qkv_format,
+            }
+            if batch.get("ptm_runtime_stats") is not None:
+                extra.update(
+                    {
+                        "ptm_runtime_input_tokens": batch["ptm_runtime_stats"]["num_input_tokens"],
+                        "ptm_runtime_merged_tokens": batch["ptm_runtime_stats"]["num_merged_tokens"],
+                        "ptm_runtime_seen_sequences": batch["ptm_runtime_stats"]["num_seen_sequences"],
+                    }
+                )
             log_prefix_tree_context(
                 stage=prefix_tree_stage or (f"{store_prefix}logprobs"),
                 context=prefix_tree_context,
-                extra={
-                    "tokens_shape": tuple(tokens.shape),
-                    "micro_batch_samples": len(unconcat_tokens),
-                    "qkv_format": args.qkv_format,
-                },
+                extra=extra,
             )
             prefix_tree_log_emitted = True
 

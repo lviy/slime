@@ -906,6 +906,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Minimum group size to mark a prefix group as mergeable.",
             )
             parser.add_argument(
+                "--slime-prefix-single-sample-logprob",
+                action="store_true",
+                default=False,
+                help=(
+                    "Force one-sample-per-micro-batch scheduling for no-grad logprob forward "
+                    "(ref/teacher/actor logprobs). Training micro-batch scheduling is unchanged."
+                ),
+            )
+            parser.add_argument(
+                "--slime-prefix-magi-attention",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable experimental PTM runtime path in no-grad logprob forward: "
+                    "Slime builds merged [1,T] + TreeMask metadata and Megatron routes to MagiAttention kernel."
+                ),
+            )
+            parser.add_argument(
                 "--get-mismatch-metrics",
                 action="store_true",
                 default=False,
@@ -1642,6 +1660,26 @@ def slime_validate_args(args):
             raise ValueError("--slime-prefix-max-len must be > 0 when set.")
         if args.slime_prefix_min_group_size < 2:
             raise ValueError("--slime-prefix-min-group-size must be >= 2.")
+    if args.slime_prefix_single_sample_logprob:
+        if not args.slime_prefix_tree_merging:
+            raise ValueError(
+                "--slime-prefix-single-sample-logprob requires --slime-prefix-tree-merging."
+            )
+        if args.use_rollout_routing_replay:
+            raise ValueError(
+                "--slime-prefix-single-sample-logprob is not compatible with --use-rollout-routing-replay yet."
+            )
+    if args.slime_prefix_magi_attention:
+        if not args.slime_prefix_tree_merging:
+            raise ValueError("--slime-prefix-magi-attention requires --slime-prefix-tree-merging.")
+        if args.qkv_format != "thd":
+            raise ValueError("--slime-prefix-magi-attention currently requires --qkv-format thd.")
+        if args.allgather_cp:
+            raise ValueError("--slime-prefix-magi-attention is not compatible with --allgather-cp yet.")
+        if getattr(args, "context_parallel_size", 1) != 1:
+            raise ValueError(
+                "--slime-prefix-magi-attention currently requires --context-parallel-size 1."
+            )
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip

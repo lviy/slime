@@ -42,6 +42,173 @@ class _TrieNode:
         return _TrieNode(count=0, children={})
 
 
+@dataclass
+class _RuntimeTrieNode:
+    token: int | None
+    parent: "_RuntimeTrieNode | None"
+    depth: int
+    children: dict[int, "_RuntimeTrieNode"]
+    index: int = -1
+
+    @staticmethod
+    def root() -> "_RuntimeTrieNode":
+        return _RuntimeTrieNode(token=None, parent=None, depth=0, children={})
+
+
+@dataclass
+class PrefixTreeBatchPlan:
+    merged_tokens: list[int]
+    q_ranges: list[list[int]]
+    k_ranges: list[list[int]]
+    attn_type_map: list[int]
+    unmerge_index: list[int]
+    matched_prefix_lens: list[int]
+    num_input_tokens: int
+    num_merged_tokens: int
+
+
+class PrefixTreeRuntimeTrieManager:
+    """Process-local persistent trie manager used by PTM runtime path."""
+
+    def __init__(self) -> None:
+        self._persistent_root = _TrieNode.new()
+        self._num_observed_sequences = 0
+
+    @property
+    def num_observed_sequences(self) -> int:
+        return self._num_observed_sequences
+
+    def _match_prefix_len(self, sequence: Sequence[int]) -> int:
+        node = self._persistent_root
+        matched = 0
+        for token in sequence:
+            child = node.children.get(int(token))
+            if child is None:
+                break
+            matched += 1
+            node = child
+        return matched
+
+    def _insert_persistent(self, sequence: Sequence[int]) -> None:
+        node = self._persistent_root
+        for token in sequence:
+            token = int(token)
+            child = node.children.get(token)
+            if child is None:
+                child = _TrieNode.new()
+                node.children[token] = child
+            child.count += 1
+            node = child
+        self._num_observed_sequences += 1
+
+    def build_batch_plan(self, tokens: Sequence[Sequence[int] | Any]) -> PrefixTreeBatchPlan:
+        sequences: list[list[int]] = [_as_int_list(t) for t in tokens]
+        if len(sequences) == 0:
+            return PrefixTreeBatchPlan(
+                merged_tokens=[],
+                q_ranges=[],
+                k_ranges=[],
+                attn_type_map=[],
+                unmerge_index=[],
+                matched_prefix_lens=[],
+                num_input_tokens=0,
+                num_merged_tokens=0,
+            )
+
+        matched_prefix_lens = [self._match_prefix_len(seq) for seq in sequences]
+        local_root = _RuntimeTrieNode.root()
+        sample_paths: list[list[_RuntimeTrieNode]] = []
+        for seq in sequences:
+            node = local_root
+            path: list[_RuntimeTrieNode] = []
+            for token in seq:
+                token = int(token)
+                child = node.children.get(token)
+                if child is None:
+                    child = _RuntimeTrieNode(token=token, parent=node, depth=node.depth + 1, children={})
+                    node.children[token] = child
+                node = child
+                path.append(node)
+            sample_paths.append(path)
+
+        merged_tokens: list[int] = []
+        parent_indices: list[int] = []
+
+        def _dfs_assign(node: _RuntimeTrieNode) -> None:
+            for child in node.children.values():
+                child.index = len(merged_tokens)
+                merged_tokens.append(int(child.token))
+                parent_index = child.parent.index if child.parent is not None else -1
+                parent_indices.append(int(parent_index))
+                _dfs_assign(child)
+
+        local_root.index = -1
+        _dfs_assign(local_root)
+
+        unmerge_index: list[int] = []
+        for path in sample_paths:
+            indices = [node.index for node in path]
+            unmerge_index.extend(indices)
+
+        q_ranges: list[list[int]] = []
+        k_ranges: list[list[int]] = []
+        attn_type_map: list[int] = []
+        for query_idx in range(len(merged_tokens)):
+            ancestor_indices: list[int] = []
+            cur = query_idx
+            while cur >= 0:
+                ancestor_indices.append(cur)
+                cur = parent_indices[cur]
+            ancestor_indices.sort()
+            if len(ancestor_indices) == 0:
+                continue
+
+            start = ancestor_indices[0]
+            prev = start
+            for idx in ancestor_indices[1:]:
+                if idx == prev + 1:
+                    prev = idx
+                    continue
+                q_ranges.append([query_idx, query_idx + 1])
+                k_ranges.append([start, prev + 1])
+                attn_type_map.append(0)
+                start = idx
+                prev = idx
+            q_ranges.append([query_idx, query_idx + 1])
+            k_ranges.append([start, prev + 1])
+            attn_type_map.append(0)
+
+        for seq in sequences:
+            self._insert_persistent(seq)
+
+        num_input_tokens = sum(len(seq) for seq in sequences)
+        return PrefixTreeBatchPlan(
+            merged_tokens=merged_tokens,
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_type_map=attn_type_map,
+            unmerge_index=unmerge_index,
+            matched_prefix_lens=matched_prefix_lens,
+            num_input_tokens=num_input_tokens,
+            num_merged_tokens=len(merged_tokens),
+        )
+
+
+_RUNTIME_PREFIX_TRIE_MANAGER: PrefixTreeRuntimeTrieManager | None = None
+
+
+def get_prefix_tree_runtime_trie_manager(reset: bool = False) -> PrefixTreeRuntimeTrieManager:
+    global _RUNTIME_PREFIX_TRIE_MANAGER
+    if reset or _RUNTIME_PREFIX_TRIE_MANAGER is None:
+        _RUNTIME_PREFIX_TRIE_MANAGER = PrefixTreeRuntimeTrieManager()
+    return _RUNTIME_PREFIX_TRIE_MANAGER
+
+
+def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> PrefixTreeBatchPlan:
+    manager = get_prefix_tree_runtime_trie_manager()
+    return manager.build_batch_plan(tokens)
+
+
 def build_prefix_group_metadata(
     tokens: Sequence[Sequence[int] | Any],
     effective_lengths: Sequence[int] | None = None,

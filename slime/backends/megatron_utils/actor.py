@@ -409,8 +409,22 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
-        # Create data iterator for log_probs and train.
+        # Create data iterator for training.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        # By default, logprob uses the same schedule as training.
+        logprob_data_iterator, logprob_num_microbatches = data_iterator, num_microbatches
+        if self.args.slime_prefix_single_sample_logprob:
+            logprob_data_iterator, logprob_num_microbatches = get_data_iterator(
+                self.args,
+                self.model,
+                rollout_data,
+                force_single_sample_microbatch=True,
+            )
+            if is_megatron_main_rank():
+                logger.info(
+                    "slime_prefix_single_sample_logprob enabled: "
+                    "using one-sample-per-micro-batch for no-grad logprob forward."
+                )
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
@@ -431,8 +445,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self._switch_model("ref")
                     rollout_data.update(
                         self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
+                            logprob_data_iterator,
+                            logprob_num_microbatches,
                             store_prefix="ref_",
                             prefix_tree_context=prefix_tree_context,
                             prefix_tree_stage="ref-logprobs",
@@ -446,8 +460,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self._switch_model("teacher")
                     rollout_data.update(
                         self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
+                            logprob_data_iterator,
+                            logprob_num_microbatches,
                             store_prefix="teacher_",
                             prefix_tree_context=prefix_tree_context,
                             prefix_tree_stage="teacher-logprobs",
@@ -463,8 +477,8 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
                     rollout_data.update(
                         self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
+                            logprob_data_iterator,
+                            logprob_num_microbatches,
                             store_prefix="",
                             prefix_tree_context=prefix_tree_context,
                             prefix_tree_stage="actor-logprobs",
