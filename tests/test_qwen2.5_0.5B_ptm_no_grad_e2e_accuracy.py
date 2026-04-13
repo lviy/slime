@@ -48,6 +48,35 @@ PTM_MIN_GROUP_SIZE = int(os.environ.get("SLIME_PTM_E2E_MIN_GROUP_SIZE", "2"))
 PTM_PREFIX_MAX_LEN = os.environ.get("SLIME_PTM_E2E_PREFIX_MAX_LEN")
 
 
+def _build_runtime_ld_library_path() -> str:
+    configured = os.environ.get("SLIME_PTM_E2E_LD_LIBRARY_PATH")
+    if configured:
+        base_paths = configured.split(":")
+    else:
+        base_paths = [
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/lib",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/lib",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cusolver/lib",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cusparse/lib",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cufft/lib",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/curand/lib",
+            "/usr/local/cuda/lib64",
+            "/usr/local/nvidia/lib",
+            "/usr/local/nvidia/lib64",
+        ]
+
+    merged_paths: list[str] = []
+    for raw_path in [*base_paths, *os.environ.get("LD_LIBRARY_PATH", "").split(":")]:
+        path = raw_path.strip()
+        if not path or path in merged_paths or not os.path.isdir(path):
+            continue
+        merged_paths.append(path)
+
+    return ":".join(merged_paths)
+
+
 def prepare() -> None:
     U.exec_command(f"mkdir -p {MODEL_ROOT} /root/datasets")
     model_path = Path(MODEL_PATH)
@@ -78,6 +107,9 @@ def _validate_runtime_gpus() -> None:
 def _runtime_env_vars() -> dict[str, str]:
     return {
         "PYTHONPATH": RUNTIME_PYTHONPATH,
+        "LD_LIBRARY_PATH": _build_runtime_ld_library_path(),
+        "CUDNN_LOGERR_DBG": "1",
+        "CUDNN_LOGDEST_DBG": "stderr",
     }
 
 
