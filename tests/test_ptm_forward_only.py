@@ -18,6 +18,13 @@ Examples:
   python3 tests/test_ptm_forward_only.py \
       --model qwen3-4B \
       --rollout-pt /tmp/rollout_0.pt
+
+  python3 tests/test_ptm_forward_only.py \
+      --rollout-pt /tmp/rollout_0.pt \
+      --model-type glm4.7-30B-A3B \
+      --model-path /root/GLM-4.7-Flash \
+      --ref-load /root/GLM-4.7-Flash_torch_dist \
+      --megatron-to-hf-mode raw
 """
 
 from __future__ import annotations
@@ -100,6 +107,25 @@ def build_parser() -> ArgumentParser:
         type=str,
         default=None,
         help="Optional override for the full local model checkpoint path.",
+    )
+    parser.add_argument(
+        "--ref-load",
+        type=str,
+        default=None,
+        help=(
+            "Optional override for the Megatron checkpoint directory used by --ref-load. "
+            "Required for models that should run with --megatron-to-hf-mode=raw."
+        ),
+    )
+    parser.add_argument(
+        "--megatron-to-hf-mode",
+        choices=["raw", "bridge"],
+        default="bridge",
+        help=(
+            "How to initialize/update HF weights. "
+            "Use `bridge` for models supported by megatron.bridge, "
+            "and `raw` when using a converted Megatron torch_dist checkpoint."
+        ),
     )
     parser.add_argument(
         "--rollout-pt",
@@ -238,8 +264,39 @@ def _runtime_env_vars() -> dict[str, str]:
     }
 
 
-def _common_args(num_rollout: int, num_gpus: int, model_path: str) -> str:
-    ckpt_args = f"--hf-checkpoint {model_path}/ " f"--ref-load {model_path}/ "
+def _default_ref_load(model_path: str) -> str:
+    return f"{model_path.rstrip('/')}_torch_dist"
+
+
+def _resolve_ref_load(megatron_to_hf_mode: str, model_path: str, ref_load: str | None) -> str:
+    if ref_load is not None:
+        return ref_load
+    if megatron_to_hf_mode == "bridge":
+        return model_path
+    return os.environ.get("SLIME_PTM_E2E_REF_LOAD", _default_ref_load(model_path))
+
+
+def _validate_ref_load(megatron_to_hf_mode: str, ref_load: str) -> None:
+    if megatron_to_hf_mode != "raw":
+        return
+    tracker = Path(ref_load) / "latest_checkpointed_iteration.txt"
+    if tracker.is_file():
+        return
+    raise FileNotFoundError(
+        "Raw mode requires --ref-load to point to a Megatron torch_dist checkpoint directory. "
+        f"Missing tracker file: {tracker}. "
+        "Convert the HF checkpoint first with `tools/convert_hf_to_torch_dist.py`."
+    )
+
+
+def _common_args(
+    num_rollout: int,
+    num_gpus: int,
+    model_path: str,
+    ref_load: str,
+    megatron_to_hf_mode: str,
+) -> str:
+    ckpt_args = f"--hf-checkpoint {model_path} " f"--ref-load {ref_load} "
 
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
@@ -287,7 +344,7 @@ def _common_args(num_rollout: int, num_gpus: int, model_path: str) -> str:
         "--actor-num-nodes 1 "
         f"--actor-num-gpus-per-node {num_gpus} "
         "--colocate "
-        "--megatron-to-hf-mode bridge "
+        f"--megatron-to-hf-mode {megatron_to_hf_mode} "
         "--seed 42 "
     )
 
@@ -307,13 +364,15 @@ def execute_phase3_only(
     num_rollout: int,
     num_gpus: int,
     model_path: str,
+    ref_load: str,
     model_type: str,
+    megatron_to_hf_mode: str,
     save_dir: str,
     save_tag: str,
     load_debug_rollout_data_subsample: float | None,
 ) -> None:
     phase_args = (
-        f"{_common_args(num_rollout, num_gpus, model_path)} "
+        f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode)} "
         f"--load-debug-rollout-data {rollout_pt} "
         f"--save-debug-train-data {save_dir}/{save_tag}_train_{{rollout_id}}_{{rank}}.pt "
         "--ci-test "
@@ -326,6 +385,9 @@ def execute_phase3_only(
     print("Phase 3 only: train-only (PTM ON) from pre-generated rollout .pt")
     print(f"Rollout input: {rollout_pt}")
     print(f"Train dump dir: {save_dir}")
+    print(f"HF checkpoint: {model_path}")
+    print(f"Ref load: {ref_load}")
+    print(f"Megatron/HF mode: {megatron_to_hf_mode}")
     print("=" * 80)
     U.execute_train(
         train_args=phase_args,
@@ -346,6 +408,8 @@ def main() -> None:
 
     _validate_runtime_gpus(args.num_gpus, model_cfg["model_path"])
     _validate_rollout_pt_path(args.rollout_pt, args.num_rollout)
+    ref_load = _resolve_ref_load(args.megatron_to_hf_mode, model_cfg["model_path"], args.ref_load)
+    _validate_ref_load(args.megatron_to_hf_mode, ref_load)
 
     if not args.skip_prepare:
         prepare(model_cfg["model_name"], model_cfg["model_path"])
@@ -359,7 +423,9 @@ def main() -> None:
         num_rollout=args.num_rollout,
         num_gpus=args.num_gpus,
         model_path=model_cfg["model_path"],
+        ref_load=ref_load,
         model_type=model_cfg["model_type"],
+        megatron_to_hf_mode=args.megatron_to_hf_mode,
         save_dir=save_dir,
         save_tag=args.save_tag,
         load_debug_rollout_data_subsample=args.load_debug_rollout_data_subsample,
