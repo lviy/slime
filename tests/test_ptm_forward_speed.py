@@ -212,6 +212,11 @@ def build_parser() -> ArgumentParser:
         default="ptm_speed",
         help="Filename prefix used when --save-debug-train-data is enabled. Default: ptm_speed.",
     )
+    parser.add_argument(
+        "--ci-test",
+        action="store_true",
+        help="Enable CI-only sanity assertions in the training pipeline. Disabled by default.",
+    )
     parser.add_argument("--skip-prepare", action="store_true", help="Skip model/dataset prepare steps if the environment is already ready.")
     return parser
 
@@ -539,12 +544,14 @@ def execute_phase3_only(
     save_tag: str,
     load_debug_rollout_data_subsample: float | None,
     save_debug_train_data: bool,
+    ci_test: bool,
 ) -> float:
     phase_args = (
         f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode, tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size, expert_model_parallel_size, expert_tensor_parallel_size, max_tokens_per_gpu, decoder_last_pipeline_num_layers)} "
         f"--load-debug-rollout-data {rollout_pt} "
-        "--ci-test "
     )
+    if ci_test:
+        phase_args += "--ci-test "
     if save_debug_train_data:
         phase_args += f"--save-debug-train-data {save_dir}/{save_tag}_train_{{rollout_id}}_{{rank}}.pt "
     if load_debug_rollout_data_subsample is not None:
@@ -664,6 +671,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 save_tag=run_tag,
                 load_debug_rollout_data_subsample=args.load_debug_rollout_data_subsample,
                 save_debug_train_data=False,
+                ci_test=args.ci_test,
             )
             runs.append(
                 {
@@ -701,6 +709,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 save_tag=run_tag,
                 load_debug_rollout_data_subsample=args.load_debug_rollout_data_subsample,
                 save_debug_train_data=args.save_debug_train_data,
+                ci_test=args.ci_test,
             )
             runs.append(
                 {
