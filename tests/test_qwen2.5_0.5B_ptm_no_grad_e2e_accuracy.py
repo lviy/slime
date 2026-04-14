@@ -110,6 +110,13 @@ def _runtime_env_vars() -> dict[str, str]:
         "LD_LIBRARY_PATH": _build_runtime_ld_library_path(),
         "CUDNN_LOGERR_DBG": "1",
         "CUDNN_LOGDEST_DBG": "stderr",
+        # This benchmark only validates rollout/train data correctness. Disable
+        # OpenTelemetry exporters in Ray workers to avoid non-essential native
+        # metrics threads crashing rollout-only startup.
+        "OTEL_SDK_DISABLED": "true",
+        "OTEL_METRICS_EXPORTER": "none",
+        "OTEL_TRACES_EXPORTER": "none",
+        "OTEL_LOGS_EXPORTER": "none",
     }
 
 
