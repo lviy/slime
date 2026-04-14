@@ -63,7 +63,8 @@ def get_batch(
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
-    pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    pad_size = tp_size * pad_multiplier
 
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
@@ -71,6 +72,7 @@ def get_batch(
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
     ptm_applied = False
+    ptm_pad = 0
     pad = 0
 
     if qkv_format == "bshd":
@@ -88,6 +90,11 @@ def get_batch(
                 device = tokens[0].device
                 dtype = tokens[0].dtype
                 merged_tokens = torch.tensor(ptm_plan.merged_tokens, dtype=dtype, device=device)
+                # PTM still runs in THD/CP=1 mode, but TP/sequence parallel may require
+                # the token stream length to be padded to a TP-aligned multiple.
+                ptm_pad = (pad_size - merged_tokens.size(0) % pad_size) % pad_size if tp_size > 1 else 0
+                if ptm_pad != 0:
+                    merged_tokens = F.pad(merged_tokens, (0, ptm_pad), value=pad_token_id)
                 cu_seqlens = torch.tensor(
                     [0, merged_tokens.size(0)], dtype=torch.int, device=torch.cuda.current_device()
                 )
@@ -115,6 +122,8 @@ def get_batch(
                 batch["ptm_runtime_stats"] = {
                     "num_input_tokens": ptm_plan.num_input_tokens,
                     "num_merged_tokens": ptm_plan.num_merged_tokens,
+                    "num_padded_tokens": ptm_pad,
+                    "num_forward_tokens": merged_tokens.size(0),
                     "matched_prefix_lens": ptm_plan.matched_prefix_lens,
                     "num_seen_sequences": get_prefix_tree_runtime_trie_manager().num_observed_sequences,
                 }
@@ -178,7 +187,10 @@ def get_batch(
     # loss masks
     if ptm_applied:
         # PTM no-grad path currently does not consume token-level loss masks.
+        # Keep padded tail tokens masked out so TP alignment padding remains inert.
         loss_masks = torch.ones_like(tokens, dtype=torch.float32)
+        if ptm_pad != 0:
+            loss_masks[:, -ptm_pad:] = 0
     else:
         loss_masks = []
         for loss_mask, total_length, response_length in zip(

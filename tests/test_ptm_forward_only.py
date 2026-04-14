@@ -48,20 +48,36 @@ DEFAULT_NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", str(max(_DETECTE
 DEFAULT_NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
 PTM_MIN_GROUP_SIZE = int(os.environ.get("SLIME_PTM_E2E_MIN_GROUP_SIZE", "2"))
 PTM_PREFIX_MAX_LEN = os.environ.get("SLIME_PTM_E2E_PREFIX_MAX_LEN")
+DEFAULT_TENSOR_MODEL_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_TENSOR_MODEL_PARALLEL_SIZE", "1"))
+DEFAULT_PIPELINE_MODEL_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_PIPELINE_MODEL_PARALLEL_SIZE", "1"))
+DEFAULT_CONTEXT_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_CONTEXT_PARALLEL_SIZE", "1"))
+DEFAULT_EXPERT_MODEL_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_EXPERT_MODEL_PARALLEL_SIZE", "1"))
+DEFAULT_EXPERT_TENSOR_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_EXPERT_TENSOR_PARALLEL_SIZE", "1"))
+DEFAULT_MAX_TOKENS_PER_GPU = int(os.environ.get("SLIME_PTM_E2E_MAX_TOKENS_PER_GPU", "4096"))
+DEFAULT_DECODER_LAST_PIPELINE_NUM_LAYERS = os.environ.get("SLIME_PTM_E2E_DECODER_LAST_PIPELINE_NUM_LAYERS")
 
 MODEL_PRESETS = {
+    "glm4.7-flash": {
+        "model_name": "GLM-4.7-Flash",
+        "model_type": "glm4.7-30B-A3B",
+        "download_model_id": None,
+    },
     "qwen2.5-0.5B": {
         "model_name": "Qwen2.5-0.5B-Instruct",
         "model_type": "qwen2.5-0.5B",
+        "download_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
     },
     "qwen3-4B": {
         "model_name": "Qwen3-4B",
         "model_type": "qwen3-4B",
+        "download_model_id": "Qwen/Qwen3-4B",
     },
 }
 
 
-def _resolve_model_config(model: str, model_name: str | None, model_type: str | None, model_path: str | None) -> dict[str, str]:
+def _resolve_model_config(
+    model: str, model_name: str | None, model_type: str | None, model_path: str | None
+) -> dict[str, str | None]:
     preset = MODEL_PRESETS.get(model)
     if preset is None:
         raise ValueError(
@@ -78,6 +94,7 @@ def _resolve_model_config(model: str, model_name: str | None, model_type: str | 
         "model_name": resolved_model_name,
         "model_type": resolved_model_type,
         "model_path": resolved_model_path,
+        "download_model_id": preset["download_model_id"],
     }
 
 
@@ -128,6 +145,55 @@ def build_parser() -> ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tensor-model-parallel-size",
+        type=int,
+        default=DEFAULT_TENSOR_MODEL_PARALLEL_SIZE,
+        help=f"Tensor parallel size. Default: {DEFAULT_TENSOR_MODEL_PARALLEL_SIZE}.",
+    )
+    parser.add_argument(
+        "--pipeline-model-parallel-size",
+        type=int,
+        default=DEFAULT_PIPELINE_MODEL_PARALLEL_SIZE,
+        help=f"Pipeline parallel size. Default: {DEFAULT_PIPELINE_MODEL_PARALLEL_SIZE}.",
+    )
+    parser.add_argument(
+        "--context-parallel-size",
+        type=int,
+        default=DEFAULT_CONTEXT_PARALLEL_SIZE,
+        help=f"Context parallel size. PTM currently requires 1. Default: {DEFAULT_CONTEXT_PARALLEL_SIZE}.",
+    )
+    parser.add_argument(
+        "--expert-model-parallel-size",
+        type=int,
+        default=DEFAULT_EXPERT_MODEL_PARALLEL_SIZE,
+        help=f"Expert parallel size. Default: {DEFAULT_EXPERT_MODEL_PARALLEL_SIZE}.",
+    )
+    parser.add_argument(
+        "--expert-tensor-parallel-size",
+        type=int,
+        default=DEFAULT_EXPERT_TENSOR_PARALLEL_SIZE,
+        help=f"Expert tensor parallel size. Default: {DEFAULT_EXPERT_TENSOR_PARALLEL_SIZE}.",
+    )
+    parser.add_argument(
+        "--max-tokens-per-gpu",
+        type=int,
+        default=DEFAULT_MAX_TOKENS_PER_GPU,
+        help=f"Max tokens per GPU for dynamic batching. Default: {DEFAULT_MAX_TOKENS_PER_GPU}.",
+    )
+    parser.add_argument(
+        "--decoder-last-pipeline-num-layers",
+        type=int,
+        default=(
+            int(DEFAULT_DECODER_LAST_PIPELINE_NUM_LAYERS)
+            if DEFAULT_DECODER_LAST_PIPELINE_NUM_LAYERS is not None
+            else None
+        ),
+        help=(
+            "Optional Megatron pipeline split hint. "
+            "Leave unset for PP=1."
+        ),
+    )
+    parser.add_argument(
         "--rollout-pt",
         required=True,
         help=(
@@ -170,6 +236,11 @@ def build_parser() -> ArgumentParser:
         action="store_true",
         help="Skip model/dataset prepare steps if the environment is already ready.",
     )
+    parser.add_argument(
+        "--ci-test",
+        action="store_true",
+        help="Enable CI-only sanity assertions in the training pipeline. Disabled by default.",
+    )
     return parser
 
 
@@ -202,13 +273,22 @@ def _build_runtime_ld_library_path() -> str:
     return ":".join(merged_paths)
 
 
-def prepare(model_name: str, model_path: str) -> None:
+def prepare(model_cfg: dict[str, str | None]) -> None:
+    model_path = str(model_cfg["model_path"])
+    model_name = str(model_cfg["model_name"])
+    download_model_id = model_cfg["download_model_id"]
+
     U.exec_command(f"mkdir -p {MODEL_ROOT} /root/datasets")
     model_path_obj = Path(model_path)
     if model_path_obj.exists() and any(model_path_obj.iterdir()):
         print(f"Skip model download since model path already exists: {model_path}")
+    elif download_model_id is not None:
+        U.exec_command(f"hf download {download_model_id} --local-dir {model_path}")
     else:
-        U.exec_command(f"hf download Qwen/{model_name} --local-dir {model_path}")
+        raise RuntimeError(
+            f"Model path does not exist and preset {model_name} has no default download source. "
+            "Please provide --model-path pointing to an existing local checkpoint or use --skip-prepare."
+        )
     U.hf_download_dataset("zhuzilin/gsm8k")
 
 
@@ -227,6 +307,39 @@ def _validate_runtime_gpus(num_gpus: int, model_path: str) -> None:
         f"PTM phase-3 runtime config: detected_cuda_gpus={_DETECTED_CUDA_GPUS}, "
         f"num_gpus={num_gpus}, model_path={model_path}"
     )
+
+
+def _validate_parallelism(
+    *,
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    context_parallel_size: int,
+    expert_model_parallel_size: int,
+    expert_tensor_parallel_size: int,
+    max_tokens_per_gpu: int,
+    decoder_last_pipeline_num_layers: int | None,
+) -> None:
+    for name, value in [
+        ("tensor_model_parallel_size", tensor_model_parallel_size),
+        ("pipeline_model_parallel_size", pipeline_model_parallel_size),
+        ("context_parallel_size", context_parallel_size),
+        ("expert_model_parallel_size", expert_model_parallel_size),
+        ("expert_tensor_parallel_size", expert_tensor_parallel_size),
+        ("max_tokens_per_gpu", max_tokens_per_gpu),
+    ]:
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {value}.")
+
+    if context_parallel_size != 1:
+        raise ValueError(
+            "PTM forward-only currently supports context_parallel_size=1 only. "
+            "TP is supported, but CP/PTM is not implemented yet."
+        )
+
+    if pipeline_model_parallel_size == 1 and decoder_last_pipeline_num_layers is not None:
+        raise ValueError(
+            "--decoder-last-pipeline-num-layers should be unset when --pipeline-model-parallel-size=1."
+        )
 
 
 def _validate_rollout_pt_path(rollout_pt: str, num_rollout: int) -> None:
@@ -295,6 +408,13 @@ def _common_args(
     model_path: str,
     ref_load: str,
     megatron_to_hf_mode: str,
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    context_parallel_size: int,
+    expert_model_parallel_size: int,
+    expert_tensor_parallel_size: int,
+    max_tokens_per_gpu: int,
+    decoder_last_pipeline_num_layers: int | None,
 ) -> str:
     ckpt_args = f"--hf-checkpoint {model_path} " f"--ref-load {ref_load} "
 
@@ -314,15 +434,17 @@ def _common_args(
     )
 
     perf_args = (
-        "--tensor-model-parallel-size 1 "
+        f"--tensor-model-parallel-size {tensor_model_parallel_size} "
         "--sequence-parallel "
-        "--pipeline-model-parallel-size 1 "
-        "--context-parallel-size 1 "
-        "--expert-model-parallel-size 1 "
-        "--expert-tensor-parallel-size 1 "
+        f"--pipeline-model-parallel-size {pipeline_model_parallel_size} "
+        f"--context-parallel-size {context_parallel_size} "
+        f"--expert-model-parallel-size {expert_model_parallel_size} "
+        f"--expert-tensor-parallel-size {expert_tensor_parallel_size} "
         "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 4096 "
+        f"--max-tokens-per-gpu {max_tokens_per_gpu} "
     )
+    if decoder_last_pipeline_num_layers is not None:
+        perf_args += f"--decoder-last-pipeline-num-layers {decoder_last_pipeline_num_layers} "
 
     grpo_args = "--advantage-estimator grpo " "--eps-clip 0.2 "
 
@@ -367,16 +489,25 @@ def execute_phase3_only(
     ref_load: str,
     model_type: str,
     megatron_to_hf_mode: str,
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    context_parallel_size: int,
+    expert_model_parallel_size: int,
+    expert_tensor_parallel_size: int,
+    max_tokens_per_gpu: int,
+    decoder_last_pipeline_num_layers: int | None,
     save_dir: str,
     save_tag: str,
     load_debug_rollout_data_subsample: float | None,
+    ci_test: bool,
 ) -> None:
     phase_args = (
-        f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode)} "
+        f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode, tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size, expert_model_parallel_size, expert_tensor_parallel_size, max_tokens_per_gpu, decoder_last_pipeline_num_layers)} "
         f"--load-debug-rollout-data {rollout_pt} "
         f"--save-debug-train-data {save_dir}/{save_tag}_train_{{rollout_id}}_{{rank}}.pt "
-        "--ci-test "
     )
+    if ci_test:
+        phase_args += "--ci-test "
     if load_debug_rollout_data_subsample is not None:
         phase_args += f"--load-debug-rollout-data-subsample {load_debug_rollout_data_subsample} "
     phase_args += _ptm_args()
@@ -388,6 +519,16 @@ def execute_phase3_only(
     print(f"HF checkpoint: {model_path}")
     print(f"Ref load: {ref_load}")
     print(f"Megatron/HF mode: {megatron_to_hf_mode}")
+    print(
+        "Parallel config: "
+        f"TP={tensor_model_parallel_size}, "
+        f"PP={pipeline_model_parallel_size}, "
+        f"CP={context_parallel_size}, "
+        f"EP={expert_model_parallel_size}, "
+        f"ETP={expert_tensor_parallel_size}, "
+        f"max_tokens_per_gpu={max_tokens_per_gpu}, "
+        f"decoder_last_pipeline_num_layers={decoder_last_pipeline_num_layers}"
+    )
     print("=" * 80)
     U.execute_train(
         train_args=phase_args,
@@ -408,11 +549,20 @@ def main() -> None:
 
     _validate_runtime_gpus(args.num_gpus, model_cfg["model_path"])
     _validate_rollout_pt_path(args.rollout_pt, args.num_rollout)
+    _validate_parallelism(
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        context_parallel_size=args.context_parallel_size,
+        expert_model_parallel_size=args.expert_model_parallel_size,
+        expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+        max_tokens_per_gpu=args.max_tokens_per_gpu,
+        decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+    )
     ref_load = _resolve_ref_load(args.megatron_to_hf_mode, model_cfg["model_path"], args.ref_load)
     _validate_ref_load(args.megatron_to_hf_mode, ref_load)
 
     if not args.skip_prepare:
-        prepare(model_cfg["model_name"], model_cfg["model_path"])
+        prepare(model_cfg)
 
     save_dir = args.save_dir or tempfile.mkdtemp(prefix="slime_ptm_phase3_from_pt_")
     os.makedirs(save_dir, exist_ok=True)
@@ -426,9 +576,17 @@ def main() -> None:
         ref_load=ref_load,
         model_type=model_cfg["model_type"],
         megatron_to_hf_mode=args.megatron_to_hf_mode,
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        context_parallel_size=args.context_parallel_size,
+        expert_model_parallel_size=args.expert_model_parallel_size,
+        expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+        max_tokens_per_gpu=args.max_tokens_per_gpu,
+        decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
         save_dir=save_dir,
         save_tag=args.save_tag,
         load_debug_rollout_data_subsample=args.load_debug_rollout_data_subsample,
+        ci_test=args.ci_test,
     )
 
 
