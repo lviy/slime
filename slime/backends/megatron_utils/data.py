@@ -74,8 +74,15 @@ def get_batch(
     ptm_applied = False
     ptm_pad = 0
     pad = 0
+    ptm_runtime_stats: dict[str, object] = {
+        "requested": bool(enable_prefix_tree_merging),
+        "applied": False,
+        "skip_reason": "disabled",
+    }
 
     if qkv_format == "bshd":
+        if enable_prefix_tree_merging:
+            ptm_runtime_stats["skip_reason"] = "unsupported_qkv_format_bshd"
         max_seqlen = batch["max_seq_lens"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
@@ -83,9 +90,24 @@ def get_batch(
         packed_seq_params = None
 
     elif qkv_format == "thd":
+        if enable_prefix_tree_merging:
+            if allgather_cp:
+                ptm_runtime_stats["skip_reason"] = "allgather_cp_enabled"
+            elif cp_size != 1:
+                ptm_runtime_stats["skip_reason"] = f"context_parallel_size_{cp_size}"
+            else:
+                ptm_runtime_stats["skip_reason"] = "no_runtime_token_reduction"
         enable_ptm_now = enable_prefix_tree_merging and not allgather_cp and cp_size == 1
         if enable_ptm_now:
             ptm_plan = build_prefix_tree_batch_plan(tokens)
+            ptm_runtime_stats.update(
+                {
+                    "num_input_tokens": ptm_plan.num_input_tokens,
+                    "num_merged_tokens": ptm_plan.num_merged_tokens,
+                    "matched_prefix_lens": ptm_plan.matched_prefix_lens,
+                    "num_seen_sequences": get_prefix_tree_runtime_trie_manager().num_observed_sequences,
+                }
+            )
             if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
                 device = tokens[0].device
                 dtype = tokens[0].dtype
@@ -119,14 +141,14 @@ def get_batch(
                 batch["ptm_unmerge_index"] = torch.tensor(
                     ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
                 )
-                batch["ptm_runtime_stats"] = {
-                    "num_input_tokens": ptm_plan.num_input_tokens,
-                    "num_merged_tokens": ptm_plan.num_merged_tokens,
-                    "num_padded_tokens": ptm_pad,
-                    "num_forward_tokens": merged_tokens.size(0),
-                    "matched_prefix_lens": ptm_plan.matched_prefix_lens,
-                    "num_seen_sequences": get_prefix_tree_runtime_trie_manager().num_observed_sequences,
-                }
+                ptm_runtime_stats.update(
+                    {
+                        "applied": True,
+                        "skip_reason": "applied",
+                        "num_padded_tokens": ptm_pad,
+                        "num_forward_tokens": merged_tokens.size(0),
+                    }
+                )
                 ptm_applied = True
 
         if ptm_applied:
@@ -183,6 +205,10 @@ def get_batch(
 
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
+    if ptm_runtime_stats["requested"] and "num_forward_tokens" not in ptm_runtime_stats:
+        ptm_runtime_stats["num_forward_tokens"] = int(tokens.numel())
+        ptm_runtime_stats["num_padded_tokens"] = int(ptm_pad if ptm_applied else pad)
+    batch["ptm_runtime_stats"] = ptm_runtime_stats
 
     # loss masks
     if ptm_applied:

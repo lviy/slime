@@ -254,19 +254,23 @@ def forward_only(
             output_tensor = output_tensor.index_select(1, ptm_unmerge_index)
 
         if prefix_tree_context is not None and not prefix_tree_log_emitted:
+            ptm_runtime_stats = batch.get("ptm_runtime_stats") or {}
             extra = {
                 "tokens_shape": tuple(tokens.shape),
                 "micro_batch_samples": len(unconcat_tokens),
+                "ptm_runtime_applied": ptm_runtime_stats.get("applied", False),
+                "ptm_runtime_requested": ptm_runtime_stats.get("requested", enable_ptm_runtime),
+                "ptm_runtime_skip_reason": ptm_runtime_stats.get("skip_reason", "unknown"),
                 "qkv_format": args.qkv_format,
             }
-            if batch.get("ptm_runtime_stats") is not None:
+            if "num_input_tokens" in ptm_runtime_stats:
                 extra.update(
                     {
-                        "ptm_runtime_input_tokens": batch["ptm_runtime_stats"]["num_input_tokens"],
-                        "ptm_runtime_merged_tokens": batch["ptm_runtime_stats"]["num_merged_tokens"],
-                        "ptm_runtime_padded_tokens": batch["ptm_runtime_stats"]["num_padded_tokens"],
-                        "ptm_runtime_forward_tokens": batch["ptm_runtime_stats"]["num_forward_tokens"],
-                        "ptm_runtime_seen_sequences": batch["ptm_runtime_stats"]["num_seen_sequences"],
+                        "ptm_runtime_input_tokens": ptm_runtime_stats["num_input_tokens"],
+                        "ptm_runtime_merged_tokens": ptm_runtime_stats["num_merged_tokens"],
+                        "ptm_runtime_padded_tokens": ptm_runtime_stats["num_padded_tokens"],
+                        "ptm_runtime_forward_tokens": ptm_runtime_stats["num_forward_tokens"],
+                        "ptm_runtime_seen_sequences": ptm_runtime_stats["num_seen_sequences"],
                     }
                 )
             log_prefix_tree_context(

@@ -479,7 +479,11 @@ def _common_args(
 
 
 def _ptm_args() -> str:
-    args = f"--slime-prefix-tree-merging --slime-prefix-min-group-size {PTM_MIN_GROUP_SIZE} "
+    args = (
+        "--slime-prefix-tree-merging "
+        "--slime-prefix-magi-attention "
+        f"--slime-prefix-min-group-size {PTM_MIN_GROUP_SIZE} "
+    )
     if PTM_PREFIX_MAX_LEN:
         args += f"--slime-prefix-max-len {PTM_PREFIX_MAX_LEN} "
     return args
