@@ -72,6 +72,11 @@ MODEL_PRESETS = {
         "model_type": "qwen3-4B",
         "download_model_id": "Qwen/Qwen3-4B",
     },
+    "qwen3-8B": {
+        "model_name": "Qwen3-8B",
+        "model_type": "qwen3-8B",
+        "download_model_id": "Qwen/Qwen3-8B",
+    },
 }
 
 
