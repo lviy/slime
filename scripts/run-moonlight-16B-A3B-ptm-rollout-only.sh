@@ -144,7 +144,7 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
-ray job submit --address=\"http://127.0.0.1:8265\" \
+ray job submit --address="http://127.0.0.1:8265" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 train.py \
   "${MODEL_ARGS[@]}" \
