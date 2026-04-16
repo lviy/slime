@@ -429,36 +429,133 @@ def get_data_iterator(
         pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
         return merged_tokens + ((pad_size - merged_tokens % pad_size) % pad_size)
 
-    def _build_ptm_aware_microbatches(step_indices: list[int], token_budget: int, target_num_mbs: int) -> list[list[int]]:
+    def _build_ptm_aware_microbatches(
+        step_indices: list[int],
+        token_budget: int,
+        target_num_mbs: int,
+        require_exact_count: bool = False,
+    ) -> list[list[int]]:
+        if not step_indices:
+            return []
+
+        assert target_num_mbs >= 1, f"target_num_mbs must be >= 1, got {target_num_mbs}"
+        assert target_num_mbs <= len(step_indices), (
+            f"target_num_mbs {target_num_mbs} exceeds sample count {len(step_indices)}"
+        )
+
+        total_lengths = rollout_data["total_lengths"]
         group_sizes = rollout_data.get("ptm_group_sizes")
         prefix_lens = rollout_data.get("ptm_prefix_lens")
+        cost_cache: dict[tuple[int, ...], int] = {}
+
+        def _prefix_len(sample_idx: int) -> int:
+            if prefix_lens is None:
+                return 0
+            return int(prefix_lens[sample_idx])
+
+        def _group_size(sample_idx: int) -> int:
+            if group_sizes is None:
+                return 1
+            return int(group_sizes[sample_idx])
+
+        def _suffix_len(sample_idx: int) -> int:
+            return max(int(total_lengths[sample_idx]) - _prefix_len(sample_idx), 0)
+
+        def _estimate_cached(sample_indices: list[int]) -> int:
+            key = tuple(sorted(sample_indices))
+            cached = cost_cache.get(key)
+            if cached is not None:
+                return cached
+            cost = int(_estimate_ptm_sched_tokens(list(key)))
+            cost_cache[key] = cost
+            return cost
+
         prioritized = sorted(
             step_indices,
             key=lambda idx: (
-                -(int(group_sizes[idx]) if group_sizes is not None else 1),
-                -(int(prefix_lens[idx]) if prefix_lens is not None else 0),
-                -int(rollout_data["total_lengths"][idx]),
+                -_prefix_len(idx),
+                -_group_size(idx),
+                _suffix_len(idx),
+                -int(total_lengths[idx]),
                 idx,
             ),
         )
-        microbatches = [[] for _ in range(target_num_mbs)]
-        microbatch_costs = [0 for _ in range(target_num_mbs)]
-        for sample_idx in prioritized:
-            best_slot = None
-            best_cost = None
+
+        microbatches: list[list[int]] = []
+        microbatch_costs: list[int] = []
+
+        for position, sample_idx in enumerate(prioritized):
+            remaining_samples = len(prioritized) - position
+            remaining_buckets_to_open = target_num_mbs - len(microbatches)
+            force_open_new_bucket = (
+                require_exact_count
+                and len(microbatches) < target_num_mbs
+                and remaining_samples == remaining_buckets_to_open
+            )
+
+            if force_open_new_bucket:
+                microbatches.append([sample_idx])
+                microbatch_costs.append(_estimate_cached([sample_idx]))
+                continue
+
+            feasible_candidates: list[tuple[int, int, int, int, int]] = []
+            overflow_candidates: list[tuple[int, int, int, int, int]] = []
+
             for slot_idx, existing in enumerate(microbatches):
                 candidate = existing + [sample_idx]
-                candidate_cost = _estimate_ptm_sched_tokens(candidate)
-                if candidate_cost <= token_budget and (best_cost is None or candidate_cost < best_cost):
-                    best_slot = slot_idx
-                    best_cost = candidate_cost
-            if best_slot is None:
-                best_slot = min(range(target_num_mbs), key=lambda i: (microbatch_costs[i], len(microbatches[i]), i))
-                candidate = microbatches[best_slot] + [sample_idx]
-                best_cost = _estimate_ptm_sched_tokens(candidate)
+                candidate_cost = _estimate_cached(candidate)
+                marginal_cost = candidate_cost - microbatch_costs[slot_idx]
+                slack = token_budget - candidate_cost
+                candidate_info = (
+                    slot_idx,
+                    candidate_cost,
+                    marginal_cost,
+                    slack,
+                    len(existing),
+                )
+                if candidate_cost <= token_budget:
+                    feasible_candidates.append(candidate_info)
+                else:
+                    overflow_candidates.append(candidate_info)
+
+            if feasible_candidates:
+                best_slot, best_cost, _, _, _ = min(
+                    feasible_candidates,
+                    key=lambda item: (
+                        item[2],
+                        -item[4],
+                        item[3],
+                        item[0],
+                    ),
+                )
+                microbatches[best_slot].append(sample_idx)
+                microbatch_costs[best_slot] = int(best_cost)
+                continue
+
+            if len(microbatches) < target_num_mbs:
+                microbatches.append([sample_idx])
+                microbatch_costs.append(_estimate_cached([sample_idx]))
+                continue
+
+            if not overflow_candidates:
+                raise RuntimeError("PTM scheduler could not place sample into any existing bucket.")
+
+            best_slot, best_cost, _, _, _ = min(
+                overflow_candidates,
+                key=lambda item: (
+                    item[1] - token_budget,
+                    item[2],
+                    -item[4],
+                    item[0],
+                ),
+            )
             microbatches[best_slot].append(sample_idx)
             microbatch_costs[best_slot] = int(best_cost)
-        return [sorted(mb) for mb in microbatches if mb]
+
+        partitions = [sorted(mb) for mb in microbatches if mb]
+        if require_exact_count:
+            assert len(partitions) == target_num_mbs, f"{len(partitions)} != {target_num_mbs}"
+        return partitions
 
     if force_single_sample_microbatch:
         if vpp_size > 1:
@@ -485,14 +582,17 @@ def get_data_iterator(
         assert len(samples) == num_local_samples
         token_budget = args.max_tokens_per_gpu * cp_size
         num_microbatches = []
-        local_ptm_partitions: list[list[list[int]]] = []
         for i in range(num_steps_per_rollout):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             if use_ptm_sched:
                 step_indices = list(range(start, end))
-                step_partitions = _build_ptm_aware_microbatches(step_indices, token_budget, target_num_mbs=len(step_indices))
+                step_partitions = _build_ptm_aware_microbatches(
+                    step_indices,
+                    token_budget,
+                    target_num_mbs=len(step_indices),
+                    require_exact_count=False,
+                )
                 num_microbatches.append(len(step_partitions))
-                local_ptm_partitions.append(step_partitions)
             else:
                 num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], token_budget))
 
@@ -513,7 +613,12 @@ def get_data_iterator(
             for i, target_num_mbs in enumerate(num_microbatches):
                 start, end = i * num_local_gbs, (i + 1) * num_local_gbs
                 step_indices = list(range(start, end))
-                partitions = _build_ptm_aware_microbatches(step_indices, token_budget, target_num_mbs=target_num_mbs)
+                partitions = _build_ptm_aware_microbatches(
+                    step_indices,
+                    token_budget,
+                    target_num_mbs=target_num_mbs,
+                    require_exact_count=True,
+                )
                 micro_batch_indices.extend(partitions)
         else:
             samples = rollout_data["total_lengths"]
