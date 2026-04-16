@@ -270,7 +270,6 @@ def forward_only(
                         "ptm_runtime_merged_tokens": ptm_runtime_stats["num_merged_tokens"],
                         "ptm_runtime_padded_tokens": ptm_runtime_stats["num_padded_tokens"],
                         "ptm_runtime_forward_tokens": ptm_runtime_stats["num_forward_tokens"],
-                        "ptm_runtime_seen_sequences": ptm_runtime_stats["num_seen_sequences"],
                     }
                 )
             log_prefix_tree_context(

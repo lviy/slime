@@ -13,7 +13,7 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
-from slime.utils.prefix_tree_merging_utils import build_prefix_tree_batch_plan, get_prefix_tree_runtime_trie_manager
+from slime.utils.prefix_tree_merging_utils import build_prefix_tree_batch_plan, estimate_prefix_tree_merged_token_count
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
 
@@ -104,8 +104,6 @@ def get_batch(
                 {
                     "num_input_tokens": ptm_plan.num_input_tokens,
                     "num_merged_tokens": ptm_plan.num_merged_tokens,
-                    "matched_prefix_lens": ptm_plan.matched_prefix_lens,
-                    "num_seen_sequences": get_prefix_tree_runtime_trie_manager().num_observed_sequences,
                 }
             )
             if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
@@ -141,14 +139,7 @@ def get_batch(
                 batch["ptm_unmerge_index"] = torch.tensor(
                     ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
                 )
-                ptm_runtime_stats.update(
-                    {
-                        "applied": True,
-                        "skip_reason": "applied",
-                        "num_padded_tokens": ptm_pad,
-                        "num_forward_tokens": merged_tokens.size(0),
-                    }
-                )
+                ptm_runtime_stats.update({"applied": True, "skip_reason": "applied"})
                 ptm_applied = True
 
         if ptm_applied:
@@ -205,7 +196,7 @@ def get_batch(
 
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
-    if ptm_runtime_stats["requested"] and "num_forward_tokens" not in ptm_runtime_stats:
+    if ptm_runtime_stats["requested"]:
         ptm_runtime_stats["num_forward_tokens"] = int(tokens.numel())
         ptm_runtime_stats["num_padded_tokens"] = int(ptm_pad if ptm_applied else pad)
     batch["ptm_runtime_stats"] = ptm_runtime_stats
@@ -427,6 +418,48 @@ def get_data_iterator(
             data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
         return data_iterator
 
+    def _estimate_ptm_sched_tokens(sample_indices: list[int]) -> int:
+        token_slices = [
+            rollout_data["tokens"][sample_idx][: rollout_data["total_lengths"][sample_idx]]
+            for sample_idx in sample_indices
+        ]
+        merged_tokens = estimate_prefix_tree_merged_token_count(token_slices)
+        if merged_tokens <= 0:
+            return 0
+        pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+        return merged_tokens + ((pad_size - merged_tokens % pad_size) % pad_size)
+
+    def _build_ptm_aware_microbatches(step_indices: list[int], token_budget: int, target_num_mbs: int) -> list[list[int]]:
+        group_sizes = rollout_data.get("ptm_group_sizes")
+        prefix_lens = rollout_data.get("ptm_prefix_lens")
+        prioritized = sorted(
+            step_indices,
+            key=lambda idx: (
+                -(int(group_sizes[idx]) if group_sizes is not None else 1),
+                -(int(prefix_lens[idx]) if prefix_lens is not None else 0),
+                -int(rollout_data["total_lengths"][idx]),
+                idx,
+            ),
+        )
+        microbatches = [[] for _ in range(target_num_mbs)]
+        microbatch_costs = [0 for _ in range(target_num_mbs)]
+        for sample_idx in prioritized:
+            best_slot = None
+            best_cost = None
+            for slot_idx, existing in enumerate(microbatches):
+                candidate = existing + [sample_idx]
+                candidate_cost = _estimate_ptm_sched_tokens(candidate)
+                if candidate_cost <= token_budget and (best_cost is None or candidate_cost < best_cost):
+                    best_slot = slot_idx
+                    best_cost = candidate_cost
+            if best_slot is None:
+                best_slot = min(range(target_num_mbs), key=lambda i: (microbatch_costs[i], len(microbatches[i]), i))
+                candidate = microbatches[best_slot] + [sample_idx]
+                best_cost = _estimate_ptm_sched_tokens(candidate)
+            microbatches[best_slot].append(sample_idx)
+            microbatch_costs[best_slot] = int(best_cost)
+        return [sorted(mb) for mb in microbatches if mb]
+
     if force_single_sample_microbatch:
         if vpp_size > 1:
             raise ValueError("force_single_sample_microbatch does not support virtual pipeline parallelism yet.")
@@ -441,15 +474,27 @@ def get_data_iterator(
         data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
     else:
         assert args.max_tokens_per_gpu is not None
-        # calculate the number of mirobatches for each step
+        use_ptm_sched = bool(
+            args.slime_prefix_magi_attention
+            and args.slime_prefix_tree_merging
+            and args.qkv_format == "thd"
+            and cp_size == 1
+            and not args.allgather_cp
+        )
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
+        token_budget = args.max_tokens_per_gpu * cp_size
         num_microbatches = []
+        local_ptm_partitions: list[list[list[int]]] = []
         for i in range(num_steps_per_rollout):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
-            num_microbatches.append(
-                get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
-            )
+            if use_ptm_sched:
+                step_indices = list(range(start, end))
+                step_partitions = _build_ptm_aware_microbatches(step_indices, token_budget, target_num_mbs=len(step_indices))
+                num_microbatches.append(len(step_partitions))
+                local_ptm_partitions.append(step_partitions)
+            else:
+                num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], token_budget))
 
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
         dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
@@ -463,18 +508,23 @@ def get_data_iterator(
 
         num_microbatches = num_microbatches.tolist()
 
-        # balance the each micro batch
-        samples = rollout_data["total_lengths"]
-        # balance the number of mirobatches across steps
         micro_batch_indices = []
-        for i, num_mbs in enumerate(num_microbatches):
-            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
-            samples = rollout_data["total_lengths"][start:end]
-            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
-            for j in range(num_mbs):
-                for k in range(len(partitions[j])):
-                    partitions[j][k] += start
-            micro_batch_indices.extend(partitions)
+        if use_ptm_sched:
+            for i, target_num_mbs in enumerate(num_microbatches):
+                start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+                step_indices = list(range(start, end))
+                partitions = _build_ptm_aware_microbatches(step_indices, token_budget, target_num_mbs=target_num_mbs)
+                micro_batch_indices.extend(partitions)
+        else:
+            samples = rollout_data["total_lengths"]
+            for i, num_mbs in enumerate(num_microbatches):
+                start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+                samples = rollout_data["total_lengths"][start:end]
+                partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
+                for j in range(num_mbs):
+                    for k in range(len(partitions[j])):
+                        partitions[j][k] += start
+                micro_batch_indices.extend(partitions)
 
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 

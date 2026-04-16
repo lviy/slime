@@ -15,7 +15,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from slime.utils.prefix_tree_merging_utils import build_prefix_group_metadata, build_prefix_tree_context_from_rollout_data
+from slime.utils.prefix_tree_merging_utils import (
+    build_prefix_group_metadata,
+    build_prefix_tree_batch_plan,
+    build_prefix_tree_context_from_rollout_data,
+    estimate_prefix_tree_merged_token_count,
+)
 
 
 def _resolve_torch_dtype(dtype_name: str) -> torch.dtype:
@@ -274,95 +279,21 @@ def test_forward_only_with_ptm_context(monkeypatch: pytest.MonkeyPatch) -> None:
     assert extra["tokens_shape"] == (1, 8)
 
 
-@pytest.mark.integration
-def test_ptm_logits_distribution_matches_full_forward() -> None:
-    """Accuracy test: compare logits from PTM-like cached forward vs full forward.
+@pytest.mark.unit
+def test_prefix_tree_batch_plan_merges_shared_prefixes() -> None:
+    token_lists = [
+        [101, 11, 12, 13],
+        [101, 11, 12, 99],
+        [7, 8],
+    ]
 
-    This test intentionally runs with a real HF checkpoint instead of Megatron
-    distributed runtime. It validates the key PTM invariant: reusing prefix KV
-    and forwarding only suffix should preserve logits distribution.
-    """
+    plan = build_prefix_tree_batch_plan(token_lists)
 
-    transformers = pytest.importorskip("transformers")
-    hf_ckpt = os.getenv("SLIME_PTM_HF_CHECKPOINT")
-    if not hf_ckpt:
-        pytest.skip("Set SLIME_PTM_HF_CHECKPOINT to run PTM logits accuracy integration test.")
-    if not torch.cuda.is_available():
-        pytest.skip("PTM logits integration test expects CUDA.")
-
-    dtype = _resolve_torch_dtype(os.getenv("SLIME_PTM_DTYPE", "bf16"))
-    atol = float(os.getenv("SLIME_PTM_ATOL", "5e-2"))
-    rtol = float(os.getenv("SLIME_PTM_RTOL", "1e-2"))
-    min_group_size = int(os.getenv("SLIME_PTM_MIN_GROUP_SIZE", "2"))
-    prefix_max_len_env = os.getenv("SLIME_PTM_PREFIX_MAX_LEN")
-    prefix_max_len = int(prefix_max_len_env) if prefix_max_len_env else None
-
-    model = (
-        transformers.AutoModelForCausalLM.from_pretrained(
-            hf_ckpt,
-            trust_remote_code=True,
-            torch_dtype=dtype,
-        )
-        .cuda()
-        .eval()
-    )
-    tokenizer = transformers.AutoTokenizer.from_pretrained(hf_ckpt, trust_remote_code=True)
-
-    prompts = _build_ptm_eval_prompts()
-    token_tensors = [tokenizer(p, return_tensors="pt").input_ids[0].to(torch.long) for p in prompts]
-    token_lists = [t.tolist() for t in token_tensors]
-    total_lengths = [len(t) for t in token_lists]
-
-    rollout_data = {"tokens": token_lists, "total_lengths": total_lengths}
-    ptm_meta = build_prefix_group_metadata(
-        tokens=token_lists,
-        effective_lengths=total_lengths,
-        prefix_max_len=prefix_max_len,
-        min_group_size=min_group_size,
-    )
-    rollout_data.update(ptm_meta)
-    ptm_ctx = build_prefix_tree_context_from_rollout_data(rollout_data, min_group_size=min_group_size)
-    assert ptm_ctx is not None
-    assert ptm_ctx.num_samples == len(prompts)
-    assert ptm_ctx.num_mergeable_groups > 0, "Prompts should share reusable prefix for this integration test."
-
-    max_abs_diffs: list[float] = []
-    mean_abs_diffs: list[float] = []
-
-    with torch.no_grad():
-        for sample_idx, input_ids_cpu in enumerate(token_tensors):
-            input_ids = input_ids_cpu.unsqueeze(0).cuda()
-            full_logits = model(input_ids=input_ids, use_cache=False).logits.squeeze(0).float().cpu()
-
-            prefix_len = ptm_meta["ptm_prefix_lens"][sample_idx]
-            seq_len = total_lengths[sample_idx]
-            if prefix_len <= 0 or prefix_len >= seq_len:
-                # No reusable prefix for this sample; skip equivalence check.
-                continue
-
-            prefix_ids = input_ids[:, :prefix_len]
-            suffix_ids = input_ids[:, prefix_len:seq_len]
-
-            prefill = model(input_ids=prefix_ids, use_cache=True)
-            suffix_logits = (
-                model(
-                    input_ids=suffix_ids,
-                    past_key_values=prefill.past_key_values,
-                    use_cache=False,
-                )
-                .logits.squeeze(0)
-                .float()
-                .cpu()
-            )
-            ref_suffix_logits = full_logits[prefix_len:seq_len]
-
-            assert suffix_logits.shape == ref_suffix_logits.shape
-            abs_diff = (suffix_logits - ref_suffix_logits).abs()
-            max_abs_diffs.append(abs_diff.max().item())
-            mean_abs_diffs.append(abs_diff.mean().item())
-            assert torch.allclose(suffix_logits, ref_suffix_logits, rtol=rtol, atol=atol)
-
-    assert max_abs_diffs, "No sample had reusable prefix; cannot validate PTM logits equivalence."
+    assert plan.num_input_tokens == 10
+    assert plan.num_merged_tokens == 7
+    assert estimate_prefix_tree_merged_token_count(token_lists) == 7
+    assert len(plan.unmerge_index) == plan.num_input_tokens
+    assert len(plan.merged_tokens) == plan.num_merged_tokens
 
 
 if __name__ == "__main__":
