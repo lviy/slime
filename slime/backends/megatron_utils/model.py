@@ -249,8 +249,13 @@ def forward_only(
             forward_kwargs.update(batch["multimodal_train_inputs"])
         output_tensor = model(**forward_kwargs)
         ptm_unmerge_index = batch.get("ptm_unmerge_index")
-        if ptm_unmerge_index is not None and isinstance(output_tensor, torch.Tensor):
-            # Recover logits layout expected by existing per-sample response slicing.
+        if (
+            ptm_unmerge_index is not None
+            and isinstance(output_tensor, torch.Tensor)
+            and mpu.is_pipeline_last_stage(ignore_virtual=True)
+        ):
+            # Only the last pipeline stage returns [B, S, V] logits. Earlier stages return
+            # hidden states in [S, B, H], so unmerging there would explode the batch dimension.
             output_tensor = output_tensor.index_select(1, ptm_unmerge_index)
 
         if prefix_tree_context is not None and not prefix_tree_log_emitted:
