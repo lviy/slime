@@ -347,12 +347,6 @@ def _runtime_env_vars() -> dict[str, str]:
     return {
         "PYTHONPATH": RUNTIME_PYTHONPATH,
         "LD_LIBRARY_PATH": _build_runtime_ld_library_path(),
-        "CUDNN_LOGERR_DBG": "1",
-        "CUDNN_LOGDEST_DBG": "stderr",
-        "OTEL_SDK_DISABLED": "true",
-        "OTEL_METRICS_EXPORTER": "none",
-        "OTEL_TRACES_EXPORTER": "none",
-        "OTEL_LOGS_EXPORTER": "none",
     }
 
 
