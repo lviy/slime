@@ -134,16 +134,16 @@ class PrefixTreeRuntimeTrieManager:
         merged_tokens: list[int] = []
         parent_indices: list[int] = []
 
-        def _dfs_assign(node: _RuntimeTrieNode) -> None:
-            for child in node.children.values():
-                child.index = len(merged_tokens)
-                merged_tokens.append(int(child.token))
-                parent_index = child.parent.index if child.parent is not None else -1
-                parent_indices.append(int(parent_index))
-                _dfs_assign(child)
-
         local_root.index = -1
-        _dfs_assign(local_root)
+        stack = list(reversed(list(local_root.children.values())))
+        while stack:
+            node = stack.pop()
+            node.index = len(merged_tokens)
+            merged_tokens.append(int(node.token))
+            parent_index = node.parent.index if node.parent is not None else -1
+            parent_indices.append(int(parent_index))
+            if node.children:
+                stack.extend(reversed(list(node.children.values())))
 
         unmerge_index: list[int] = []
         for path in sample_paths:
