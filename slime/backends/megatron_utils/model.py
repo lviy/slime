@@ -26,6 +26,7 @@ from slime.utils import logging_utils
 from slime.utils.hf_compat import patch_qwen2_rope_theta_compat
 from slime.utils.memory_utils import clear_memory
 from slime.utils.prefix_tree_merging_utils import PrefixTreeMergingContext, log_prefix_tree_context
+from slime.utils.timer import Timer
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
@@ -33,6 +34,18 @@ from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
+
+
+_LOGPROB_BREAKDOWN_ENV = "SLIME_PTM_LOGPROB_BREAKDOWN"
+
+
+def _should_profile_logprob_breakdown() -> bool:
+    return os.environ.get(_LOGPROB_BREAKDOWN_ENV, "0").strip().lower() in {"1", "true", "yes"}
+
+
+def _cuda_sync_if_needed() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -210,6 +223,8 @@ def forward_only(
         nonlocal prefix_tree_log_emitted
 
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
+        breakdown_enabled = _should_profile_logprob_breakdown()
+        profile_timer_prefix = f"{store_prefix}log_probs"
         enable_ptm_runtime = bool(
             getattr(args, "slime_prefix_magi_attention", False)
             and prefix_tree_context is not None
@@ -217,6 +232,12 @@ def forward_only(
         )
 
         # Get the batch.
+        if breakdown_enabled:
+            _cuda_sync_if_needed()
+            batch_start_time = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            batch_end_time = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            if batch_start_time is not None:
+                batch_start_time.record()
         batch = get_batch(
             data_iterator,
             [
@@ -232,6 +253,18 @@ def forward_only(
             args.allgather_cp,
             enable_prefix_tree_merging=enable_ptm_runtime,
         )
+        if breakdown_enabled and batch_start_time is not None and batch_end_time is not None:
+            batch_end_time.record()
+            _cuda_sync_if_needed()
+            elapsed_s = batch_start_time.elapsed_time(batch_end_time) / 1000.0
+            Timer().add(f"{profile_timer_prefix}_get_batch", elapsed_s)
+            logger.info(
+                "[PTMProfile] stage=%s component=get_batch ptm_enabled=%s applied=%s elapsed_ms=%.3f",
+                prefix_tree_stage or (f"{store_prefix}logprobs"),
+                enable_ptm_runtime,
+                bool((batch.get("ptm_runtime_stats") or {}).get("applied", False)),
+                elapsed_s * 1000.0,
+            )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
         packed_seq_params = batch["packed_seq_params"]
@@ -247,7 +280,25 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
+        if breakdown_enabled:
+            _cuda_sync_if_needed()
+            forward_start_time = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            forward_end_time = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            if forward_start_time is not None:
+                forward_start_time.record()
         output_tensor = model(**forward_kwargs)
+        if breakdown_enabled and forward_start_time is not None and forward_end_time is not None:
+            forward_end_time.record()
+            _cuda_sync_if_needed()
+            elapsed_s = forward_start_time.elapsed_time(forward_end_time) / 1000.0
+            Timer().add(f"{profile_timer_prefix}_model_forward", elapsed_s)
+            logger.info(
+                "[PTMProfile] stage=%s component=model_forward ptm_enabled=%s applied=%s elapsed_ms=%.3f",
+                prefix_tree_stage or (f"{store_prefix}logprobs"),
+                enable_ptm_runtime,
+                bool((batch.get("ptm_runtime_stats") or {}).get("applied", False)),
+                elapsed_s * 1000.0,
+            )
         ptm_unmerge_index = batch.get("ptm_unmerge_index")
         if (
             ptm_unmerge_index is not None
@@ -256,7 +307,25 @@ def forward_only(
         ):
             # Only the last pipeline stage returns [B, S, V] logits. Earlier stages return
             # hidden states in [S, B, H], so unmerging there would explode the batch dimension.
+            if breakdown_enabled:
+                _cuda_sync_if_needed()
+                unmerge_start_time = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+                unmerge_end_time = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+                if unmerge_start_time is not None:
+                    unmerge_start_time.record()
             output_tensor = output_tensor.index_select(1, ptm_unmerge_index)
+            if breakdown_enabled and unmerge_start_time is not None and unmerge_end_time is not None:
+                unmerge_end_time.record()
+                _cuda_sync_if_needed()
+                elapsed_s = unmerge_start_time.elapsed_time(unmerge_end_time) / 1000.0
+                Timer().add(f"{profile_timer_prefix}_ptm_unmerge", elapsed_s)
+                logger.info(
+                    "[PTMProfile] stage=%s component=ptm_unmerge ptm_enabled=%s applied=%s elapsed_ms=%.3f",
+                    prefix_tree_stage or (f"{store_prefix}logprobs"),
+                    enable_ptm_runtime,
+                    bool((batch.get("ptm_runtime_stats") or {}).get("applied", False)),
+                    elapsed_s * 1000.0,
+                )
 
         if prefix_tree_context is not None and not prefix_tree_log_emitted:
             ptm_runtime_stats = batch.get("ptm_runtime_stats") or {}
@@ -292,6 +361,7 @@ def forward_only(
             response_lengths=response_lengths,
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
+            profile_timer_prefix=profile_timer_prefix,
         )
 
     # Turn on evaluation mode which disables dropout.
