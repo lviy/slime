@@ -1,6 +1,8 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -15,6 +17,7 @@ from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.prefix_tree_merging_utils import build_prefix_tree_batch_plan, estimate_prefix_tree_merged_token_count
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
+from slime.utils.timer import Timer
 from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
@@ -30,6 +33,7 @@ def get_batch(
     qkv_format: str = "thd",
     allgather_cp: bool = False,
     enable_prefix_tree_merging: bool = False,
+    profile_timer_prefix: str | None = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -98,6 +102,14 @@ def get_batch(
             else:
                 ptm_runtime_stats["skip_reason"] = "no_runtime_token_reduction"
         enable_ptm_now = enable_prefix_tree_merging and not allgather_cp and cp_size == 1
+        ptm_profile_enabled = profile_timer_prefix is not None and os.environ.get(
+            "SLIME_PTM_LOGPROB_BREAKDOWN", "0"
+        ).strip().lower() in {"1", "true", "yes"}
+        if ptm_profile_enabled and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            ptm_profile_start = perf_counter()
+        else:
+            ptm_profile_start = None
         if enable_ptm_now:
             ptm_plan = build_prefix_tree_batch_plan(tokens)
             ptm_runtime_stats.update(
@@ -141,6 +153,11 @@ def get_batch(
                 )
                 ptm_runtime_stats.update({"applied": True, "skip_reason": "applied"})
                 ptm_applied = True
+        if ptm_profile_start is not None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elapsed_s = perf_counter() - ptm_profile_start
+            Timer().add(f"{profile_timer_prefix}_ptm", elapsed_s)
 
         if ptm_applied:
             pass

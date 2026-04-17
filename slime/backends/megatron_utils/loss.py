@@ -21,7 +21,6 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.timer import Timer
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -390,7 +389,6 @@ def get_log_probs_and_entropy(
     with_entropy: bool = False,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
-    profile_timer_prefix: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -431,16 +429,6 @@ def get_log_probs_and_entropy(
     )
 
     # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
-    profile_breakdown = profile_timer_prefix is not None
-    if profile_breakdown and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        ce_start = torch.cuda.Event(enable_timing=True)
-        ce_end = torch.cuda.Event(enable_timing=True)
-        ce_start.record()
-    else:
-        ce_start = None
-        ce_end = None
-
     log_prob_full, entropy_full = calculate_log_probs_and_entropy(
         logits,
         full_tokens,
@@ -449,12 +437,6 @@ def get_log_probs_and_entropy(
         chunk_size=chunk_size,
         need_entropy_grad=need_entropy_grad,
     )
-
-    if profile_breakdown and ce_start is not None and ce_end is not None:
-        ce_end.record()
-        torch.cuda.synchronize()
-        elapsed_s = ce_start.elapsed_time(ce_end) / 1000.0
-        Timer().add(f"{profile_timer_prefix}_postprocess", elapsed_s)
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
     # --- extract per-sample response portions ---
