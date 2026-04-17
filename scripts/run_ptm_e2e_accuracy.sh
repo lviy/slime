@@ -24,4 +24,4 @@ if [[ -z "${SLIME_PTM_E2E_NUM_GPUS:-}" ]]; then
   fi
 fi
 
-python3 tests/test_qwen2.5_0.5B_ptm_no_grad_e2e_accuracy.py "$@"
+python3 tests/test_qwen2.5_0.5B_ptm_e2e_accuracy.py "$@"

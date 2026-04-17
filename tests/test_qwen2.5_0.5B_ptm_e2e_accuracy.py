@@ -1,15 +1,16 @@
 """
-Three-phase PTM no-grad E2E accuracy comparison:
+Three-phase PTM E2E accuracy comparison:
 
 1) Generate fixed rollout data once (debug-rollout-only).
-2) Run train-only on the same rollout data with PTM OFF and dump train data.
-3) Run train-only on the same rollout data with PTM ON and dump train data.
+2) Run train-only on the same rollout data with PTM OFF and save HF weights.
+3) Run train-only on the same rollout data with PTM ON and save HF weights.
 
-Finally, compare no-grad outputs (default: log_probs/ref_log_probs) between PTM OFF/ON.
+Finally, compare PTM OFF/ON saved HF weights and verify every tensor matches.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -31,19 +32,8 @@ RUNTIME_PYTHONPATH = os.environ.get("SLIME_PTM_E2E_PYTHONPATH", f"{SGLANG_PYTHON
 _DETECTED_CUDA_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
 NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", str(max(_DETECTED_CUDA_GPUS, 1))))
 NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
-
-COMPARE_KEYS = tuple(
-    key.strip()
-    for key in os.environ.get("SLIME_PTM_E2E_COMPARE_KEYS", "log_probs").split(",")
-    if key.strip()
-)
-STRICT_COMPARE_KEYS = os.environ.get("SLIME_PTM_E2E_STRICT_COMPARE_KEYS", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-}
-ATOL = float(os.environ.get("SLIME_PTM_E2E_ATOL", "1e-6"))
-RTOL = float(os.environ.get("SLIME_PTM_E2E_RTOL", "1e-6"))
+ATOL = float(os.environ.get("SLIME_PTM_E2E_ATOL", "0.0"))
+RTOL = float(os.environ.get("SLIME_PTM_E2E_RTOL", "0.0"))
 PTM_MIN_GROUP_SIZE = int(os.environ.get("SLIME_PTM_E2E_MIN_GROUP_SIZE", "2"))
 PTM_PREFIX_MAX_LEN = os.environ.get("SLIME_PTM_E2E_PREFIX_MAX_LEN")
 
@@ -110,8 +100,8 @@ def _runtime_env_vars() -> dict[str, str]:
         "LD_LIBRARY_PATH": _build_runtime_ld_library_path(),
         "CUDNN_LOGERR_DBG": "1",
         "CUDNN_LOGDEST_DBG": "stderr",
-        # This benchmark only validates rollout/train data correctness. Disable
-        # OpenTelemetry exporters in Ray workers to avoid non-essential native
+        # This test only validates rollout/train correctness. Disable
+        # OpenTelemetry exporters in Ray workers to avoid unrelated native
         # metrics threads crashing rollout-only startup.
         "OTEL_SDK_DISABLED": "true",
         "OTEL_METRICS_EXPORTER": "none",
@@ -210,10 +200,16 @@ def execute_rollout_only(debug_data_dir: str) -> None:
 
 
 def execute_train_only(debug_data_dir: str, *, ptm_enabled: bool, tag: str) -> None:
+    save_root = Path(debug_data_dir) / f"{tag}_megatron_ckpt"
+    save_hf_root = Path(debug_data_dir) / f"{tag}_hf_{{rollout_id}}"
     phase_args = (
         f"{_common_args()} "
         f"--load-debug-rollout-data {debug_data_dir}/rollout_{{rollout_id}}.pt "
-        f"--save-debug-train-data {debug_data_dir}/{tag}_train_{{rollout_id}}_{{rank}}.pt "
+        f"--save {save_root} "
+        "--save-interval 1 "
+        "--no-save-optim "
+        "--no-save-rng "
+        f"--save-hf {save_hf_root} "
         "--ci-test "
     )
     if ptm_enabled:
@@ -230,133 +226,169 @@ def execute_train_only(debug_data_dir: str, *, ptm_enabled: bool, tag: str) -> N
     )
 
 
-def _load_dump_index(debug_data_dir: str, tag: str) -> dict[tuple[int, int], dict]:
-    index: dict[tuple[int, int], dict] = {}
-    for path in sorted(Path(debug_data_dir).glob(f"{tag}_train_*.pt")):
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        rollout_id = int(payload["rollout_id"])
-        rank = int(payload["rank"])
-        index[(rollout_id, rank)] = payload["rollout_data"]
-    if not index:
-        raise AssertionError(f"No train dump files found for tag={tag} under {debug_data_dir}")
-    return index
+def _saved_hf_dirs(debug_data_dir: str, tag: str) -> dict[int, Path]:
+    prefix = f"{tag}_hf_"
+    saved_dirs: dict[int, Path] = {}
+    for path in sorted(Path(debug_data_dir).glob(f"{tag}_hf_*")):
+        if not path.is_dir():
+            continue
+        suffix = path.name[len(prefix) :]
+        if not suffix.isdigit():
+            continue
+        saved_dirs[int(suffix)] = path
+    if not saved_dirs:
+        raise AssertionError(f"No saved HF model directories found for tag={tag} under {debug_data_dir}")
+    return saved_dirs
 
 
-def _compare_tensor_lists(
-    off_vals: list[torch.Tensor],
-    on_vals: list[torch.Tensor],
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def _load_safetensors_state_dict(model_dir: Path, filenames: list[str]) -> dict[str, torch.Tensor]:
+    try:
+        from safetensors.torch import load_file
+    except ImportError as exc:
+        raise RuntimeError(
+            "Loading PTM E2E HF checkpoints requires `safetensors` in the runtime environment."
+        ) from exc
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for filename in filenames:
+        state_dict.update(load_file(str(model_dir / filename), device="cpu"))
+    return state_dict
+
+
+def _load_pytorch_state_dict(model_dir: Path, filenames: list[str]) -> dict[str, torch.Tensor]:
+    state_dict: dict[str, torch.Tensor] = {}
+    for filename in filenames:
+        shard = torch.load(model_dir / filename, map_location="cpu", weights_only=False)
+        if isinstance(shard, dict) and "state_dict" in shard and isinstance(shard["state_dict"], dict):
+            shard = shard["state_dict"]
+        if not isinstance(shard, dict):
+            raise AssertionError(f"Unsupported PyTorch checkpoint shard format: {model_dir / filename}")
+
+        tensor_items = {key: value for key, value in shard.items() if isinstance(value, torch.Tensor)}
+        if len(tensor_items) != len(shard):
+            non_tensor_keys = sorted(key for key, value in shard.items() if not isinstance(value, torch.Tensor))
+            raise AssertionError(
+                f"Expected only tensor entries in HF checkpoint shard {model_dir / filename}, "
+                f"but found non-tensor keys: {non_tensor_keys}"
+            )
+        state_dict.update(tensor_items)
+    return state_dict
+
+
+def _load_saved_hf_state_dict(model_dir: Path) -> dict[str, torch.Tensor]:
+    safetensors_index = model_dir / "model.safetensors.index.json"
+    if safetensors_index.exists():
+        index_data = _load_json(safetensors_index)
+        filenames = sorted(set(index_data["weight_map"].values()))
+        return _load_safetensors_state_dict(model_dir, filenames)
+
+    safetensors_files = sorted(path.name for path in model_dir.glob("*.safetensors"))
+    if safetensors_files:
+        return _load_safetensors_state_dict(model_dir, safetensors_files)
+
+    pytorch_index = model_dir / "pytorch_model.bin.index.json"
+    if pytorch_index.exists():
+        index_data = _load_json(pytorch_index)
+        filenames = sorted(set(index_data["weight_map"].values()))
+        return _load_pytorch_state_dict(model_dir, filenames)
+
+    pytorch_files = sorted(path.name for path in model_dir.glob("pytorch_model*.bin"))
+    if pytorch_files:
+        return _load_pytorch_state_dict(model_dir, pytorch_files)
+
+    raise AssertionError(f"Could not find supported HF weight files under {model_dir}")
+
+
+def _compare_weight_tensors(
+    off_tensor: torch.Tensor,
+    on_tensor: torch.Tensor,
     *,
-    key: str,
     rollout_id: int,
-    rank: int,
+    weight_name: str,
 ) -> tuple[float, float]:
-    if len(off_vals) != len(on_vals):
+    if off_tensor.shape != on_tensor.shape:
         raise AssertionError(
-            f"Length mismatch for key={key} at rollout_id={rollout_id}, rank={rank}: "
-            f"{len(off_vals)} != {len(on_vals)}"
+            f"Shape mismatch for weight={weight_name} at rollout_id={rollout_id}: "
+            f"{tuple(off_tensor.shape)} != {tuple(on_tensor.shape)}"
+        )
+    if off_tensor.dtype != on_tensor.dtype:
+        raise AssertionError(
+            f"Dtype mismatch for weight={weight_name} at rollout_id={rollout_id}: "
+            f"{off_tensor.dtype} != {on_tensor.dtype}"
         )
 
-    local_max_abs = 0.0
-    local_mean_abs_sum = 0.0
-    local_mean_abs_count = 0
-    for i, (off_t, on_t) in enumerate(zip(off_vals, on_vals, strict=True)):
-        if not isinstance(off_t, torch.Tensor) or not isinstance(on_t, torch.Tensor):
+    off_cpu = off_tensor.detach().cpu()
+    on_cpu = on_tensor.detach().cpu()
+
+    if not off_cpu.is_floating_point():
+        if not torch.equal(off_cpu, on_cpu):
+            mismatch_count = int((off_cpu != on_cpu).sum().item())
             raise AssertionError(
-                f"Expected tensor list for key={key}, got {type(off_t)} and {type(on_t)} "
-                f"at rollout_id={rollout_id}, rank={rank}, idx={i}"
+                f"Non-floating weight mismatch for weight={weight_name} at rollout_id={rollout_id}: "
+                f"mismatch_count={mismatch_count}"
             )
-        if off_t.shape != on_t.shape:
-            raise AssertionError(
-                f"Shape mismatch for key={key} at rollout_id={rollout_id}, rank={rank}, idx={i}: "
-                f"{tuple(off_t.shape)} != {tuple(on_t.shape)}"
-            )
+        return 0.0, 0.0
 
-        off_fp = off_t.detach().float().cpu()
-        on_fp = on_t.detach().float().cpu()
-        if not torch.allclose(off_fp, on_fp, rtol=RTOL, atol=ATOL):
-            diff = (off_fp - on_fp).abs()
-            raise AssertionError(
-                f"PTM accuracy mismatch for key={key} at rollout_id={rollout_id}, rank={rank}, idx={i}: "
-                f"max_abs={diff.max().item():.6e}, mean_abs={diff.mean().item():.6e}, "
-                f"rtol={RTOL}, atol={ATOL}"
-            )
+    if torch.equal(off_cpu, on_cpu):
+        return 0.0, 0.0
 
-        diff = (off_fp - on_fp).abs()
-        local_max_abs = max(local_max_abs, diff.max().item())
-        local_mean_abs_sum += diff.mean().item()
-        local_mean_abs_count += 1
-
-    local_mean_abs = local_mean_abs_sum / max(local_mean_abs_count, 1)
-    return local_max_abs, local_mean_abs
+    diff = (off_cpu.float() - on_cpu.float()).abs()
+    max_abs = diff.max().item() if diff.numel() > 0 else 0.0
+    mean_abs = diff.mean().item() if diff.numel() > 0 else 0.0
+    if not torch.allclose(off_cpu.float(), on_cpu.float(), rtol=RTOL, atol=ATOL):
+        raise AssertionError(
+            f"PTM weight mismatch for weight={weight_name} at rollout_id={rollout_id}: "
+            f"max_abs={max_abs:.6e}, mean_abs={mean_abs:.6e}, rtol={RTOL}, atol={ATOL}"
+        )
+    return max_abs, mean_abs
 
 
-def compare_no_grad_outputs(debug_data_dir: str) -> None:
-    off_index = _load_dump_index(debug_data_dir, "ptm_off")
-    on_index = _load_dump_index(debug_data_dir, "ptm_on")
-    if set(off_index.keys()) != set(on_index.keys()):
-        only_off = sorted(set(off_index.keys()) - set(on_index.keys()))
-        only_on = sorted(set(on_index.keys()) - set(off_index.keys()))
-        raise AssertionError(f"Dump key mismatch. only_off={only_off}, only_on={only_on}")
+def compare_saved_weights(debug_data_dir: str) -> None:
+    off_dirs = _saved_hf_dirs(debug_data_dir, "ptm_off")
+    on_dirs = _saved_hf_dirs(debug_data_dir, "ptm_on")
+    if set(off_dirs.keys()) != set(on_dirs.keys()):
+        only_off = sorted(set(off_dirs.keys()) - set(on_dirs.keys()))
+        only_on = sorted(set(on_dirs.keys()) - set(off_dirs.keys()))
+        raise AssertionError(f"Saved HF rollout mismatch. only_off={only_off}, only_on={only_on}")
 
     global_max_abs = 0.0
     global_mean_abs_sum = 0.0
-    global_mean_abs_count = 0
-    skipped_keys: set[str] = set()
-    first_pair_keys = None
+    global_weight_count = 0
 
-    for key_tuple in sorted(off_index.keys()):
-        rollout_id, rank = key_tuple
-        off_data = off_index[key_tuple]
-        on_data = on_index[key_tuple]
-        if first_pair_keys is None:
-            first_pair_keys = (sorted(off_data.keys()), sorted(on_data.keys()))
+    for rollout_id in sorted(off_dirs.keys()):
+        off_state = _load_saved_hf_state_dict(off_dirs[rollout_id])
+        on_state = _load_saved_hf_state_dict(on_dirs[rollout_id])
+        if set(off_state.keys()) != set(on_state.keys()):
+            only_off = sorted(set(off_state.keys()) - set(on_state.keys()))
+            only_on = sorted(set(on_state.keys()) - set(off_state.keys()))
+            raise AssertionError(
+                f"Weight key mismatch at rollout_id={rollout_id}: "
+                f"only_off={only_off[:10]}, only_on={only_on[:10]}"
+            )
 
-        for cmp_key in COMPARE_KEYS:
-            if cmp_key not in off_data or cmp_key not in on_data:
-                if STRICT_COMPARE_KEYS:
-                    if cmp_key not in off_data:
-                        raise AssertionError(
-                            f"Missing key={cmp_key} in PTM OFF dump for rollout_id={rollout_id}, rank={rank}"
-                        )
-                    raise AssertionError(
-                        f"Missing key={cmp_key} in PTM ON dump for rollout_id={rollout_id}, rank={rank}"
-                    )
-                skipped_keys.add(cmp_key)
-                continue
-
-            off_vals = off_data[cmp_key]
-            on_vals = on_data[cmp_key]
-            if not isinstance(off_vals, (list, tuple)) or not isinstance(on_vals, (list, tuple)):
-                raise AssertionError(
-                    f"Only list/tuple tensor values are supported for compare key={cmp_key}, "
-                    f"got {type(off_vals)} and {type(on_vals)}"
-                )
-
-            max_abs, mean_abs = _compare_tensor_lists(
-                list(off_vals),
-                list(on_vals),
-                key=cmp_key,
+        for weight_name in sorted(off_state.keys()):
+            max_abs, mean_abs = _compare_weight_tensors(
+                off_state[weight_name],
+                on_state[weight_name],
                 rollout_id=rollout_id,
-                rank=rank,
+                weight_name=weight_name,
             )
             global_max_abs = max(global_max_abs, max_abs)
             global_mean_abs_sum += mean_abs
-            global_mean_abs_count += 1
+            global_weight_count += 1
 
-    if global_mean_abs_count == 0:
-        off_keys = first_pair_keys[0] if first_pair_keys is not None else []
-        on_keys = first_pair_keys[1] if first_pair_keys is not None else []
-        raise AssertionError(
-            "No comparable keys found in PTM OFF/ON dumps. "
-            f"requested_keys={COMPARE_KEYS}, off_keys_sample={off_keys}, on_keys_sample={on_keys}"
-        )
+    if global_weight_count == 0:
+        raise AssertionError("No HF weights were compared between PTM OFF and PTM ON runs.")
 
-    global_mean_abs = global_mean_abs_sum / max(global_mean_abs_count, 1)
+    global_mean_abs = global_mean_abs_sum / global_weight_count
     print("=" * 80)
-    print("PTM no-grad E2E accuracy PASSED")
-    print(f"Compared keys: {COMPARE_KEYS}")
-    if skipped_keys:
-        print(f"Skipped missing keys (non-strict mode): {sorted(skipped_keys)}")
+    print("PTM E2E weight accuracy PASSED")
+    print(f"Compared rollout_ids: {sorted(off_dirs.keys())}")
+    print(f"Compared weights: {global_weight_count}")
     print(f"Global max_abs_diff={global_max_abs:.6e}, global mean_abs_diff={global_mean_abs:.6e}")
     print(f"Thresholds: rtol={RTOL}, atol={ATOL}")
     print("=" * 80)
@@ -364,13 +396,13 @@ def compare_no_grad_outputs(debug_data_dir: str) -> None:
 
 def execute() -> None:
     _validate_runtime_gpus()
-    debug_data_dir = tempfile.mkdtemp(prefix="slime_ptm_nograd_e2e_")
+    debug_data_dir = tempfile.mkdtemp(prefix="slime_ptm_e2e_")
     print(f"Using temp dir: {debug_data_dir}")
 
     execute_rollout_only(debug_data_dir)
     execute_train_only(debug_data_dir, ptm_enabled=False, tag="ptm_off")
     execute_train_only(debug_data_dir, ptm_enabled=True, tag="ptm_on")
-    compare_no_grad_outputs(debug_data_dir)
+    compare_saved_weights(debug_data_dir)
 
 
 if __name__ == "__main__":

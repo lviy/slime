@@ -1,7 +1,7 @@
 """
 Run only the PTM ON train-only phase using pre-generated rollout .pt data.
 
-Compared with `test_qwen2.5_0.5B_ptm_no_grad_e2e_accuracy.py`, this script:
+Compared with `test_qwen2.5_0.5B_ptm_e2e_accuracy.py`, this script:
 1) Skips rollout generation entirely.
 2) Loads rollout data from a user-provided `.pt` path or template.
 3) Runs only the PTM ON train-only phase and optionally dumps train data.
