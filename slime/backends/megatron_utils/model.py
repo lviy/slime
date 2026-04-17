@@ -355,6 +355,9 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
+    prefix_tree_context: PrefixTreeMergingContext | None = None,
+    prefix_tree_stage: str | None = None,
+    prefix_tree_log_emitted: list[bool] | None = None,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -403,6 +406,11 @@ def train_one_step(
             Output tensor(s) and the loss function, which returns
             (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
         """
+        enable_ptm_runtime = bool(
+            getattr(args, "slime_prefix_magi_attention", False)
+            and prefix_tree_context is not None
+            and prefix_tree_context.enabled
+        )
 
         # Get the batch.
         batch = get_batch(
@@ -426,6 +434,7 @@ def train_one_step(
             args.data_pad_size_multiplier,
             args.qkv_format,
             args.allgather_cp,
+            enable_prefix_tree_merging=enable_ptm_runtime,
         )
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
@@ -460,6 +469,46 @@ def train_one_step(
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
             output_tensor = model(**forward_kwargs)
+
+        ptm_unmerge_index = batch.get("ptm_unmerge_index")
+        if (
+            ptm_unmerge_index is not None
+            and isinstance(output_tensor, torch.Tensor)
+            and mpu.is_pipeline_last_stage(ignore_virtual=True)
+        ):
+            # Training loss still expects logits laid out in the original per-sample token order.
+            # Autograd on index_select accumulates repeated-prefix gradients back to merged positions.
+            output_tensor = output_tensor.index_select(1, ptm_unmerge_index)
+
+        if (
+            prefix_tree_context is not None
+            and prefix_tree_log_emitted is not None
+            and not prefix_tree_log_emitted[0]
+        ):
+            ptm_runtime_stats = batch.get("ptm_runtime_stats") or {}
+            extra = {
+                "tokens_shape": tuple(batch["tokens"].shape),
+                "micro_batch_samples": len(batch["unconcat_tokens"]),
+                "ptm_runtime_applied": ptm_runtime_stats.get("applied", False),
+                "ptm_runtime_requested": ptm_runtime_stats.get("requested", enable_ptm_runtime),
+                "ptm_runtime_skip_reason": ptm_runtime_stats.get("skip_reason", "unknown"),
+                "qkv_format": args.qkv_format,
+            }
+            if "num_input_tokens" in ptm_runtime_stats:
+                extra.update(
+                    {
+                        "ptm_runtime_input_tokens": ptm_runtime_stats["num_input_tokens"],
+                        "ptm_runtime_merged_tokens": ptm_runtime_stats["num_merged_tokens"],
+                        "ptm_runtime_padded_tokens": ptm_runtime_stats["num_padded_tokens"],
+                        "ptm_runtime_forward_tokens": ptm_runtime_stats["num_forward_tokens"],
+                    }
+                )
+            log_prefix_tree_context(
+                stage=prefix_tree_stage or "train",
+                context=prefix_tree_context,
+                extra=extra,
+            )
+            prefix_tree_log_emitted[0] = True
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -545,6 +594,8 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
+    prefix_tree_context: PrefixTreeMergingContext | None = None,
+    prefix_tree_stage: str | None = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -633,6 +684,7 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    prefix_tree_log_emitted = [False]
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
@@ -647,6 +699,9 @@ def train(
             optimizer,
             opt_param_scheduler,
             num_microbatches[step_id],
+            prefix_tree_context=prefix_tree_context,
+            prefix_tree_stage=prefix_tree_stage,
+            prefix_tree_log_emitted=prefix_tree_log_emitted,
         )
 
         if step_id == 0:

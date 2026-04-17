@@ -382,7 +382,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        data_iterator, num_microbatches = get_data_iterator(
+            self.args,
+            self.model,
+            rollout_data,
+            enable_ptm_aware_dynamic_batching=False,
+        )
         rollout_data.update(
             forward_only(
                 get_values,
@@ -406,11 +411,18 @@ class MegatronTrainRayActor(TrainRayActor):
             self.opt_param_scheduler,
             data_iterator,
             num_microbatches,
+            prefix_tree_context=prefix_tree_context,
+            prefix_tree_stage="actor-train",
         )
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for training.
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        data_iterator, num_microbatches = get_data_iterator(
+            self.args,
+            self.model,
+            rollout_data,
+            enable_ptm_aware_dynamic_batching=False,
+        )
         # By default, logprob uses the same schedule as training.
         logprob_data_iterator, logprob_num_microbatches = data_iterator, num_microbatches
         if self.args.slime_prefix_single_sample_logprob:
@@ -424,6 +436,21 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(
                     "slime_prefix_single_sample_logprob enabled: "
                     "using one-sample-per-micro-batch for no-grad logprob forward."
+                )
+        elif self.args.slime_prefix_tree_merging and self.args.slime_prefix_magi_attention:
+            # PTM runtime currently only applies to the no-grad logprob forward path.
+            # Keep training on original-length budgeting so PTM-compressed scheduling
+            # does not overpack actor_train and trigger CE OOMs.
+            logprob_data_iterator, logprob_num_microbatches = get_data_iterator(
+                self.args,
+                self.model,
+                rollout_data,
+                enable_ptm_aware_dynamic_batching=True,
+            )
+            if is_megatron_main_rank():
+                logger.info(
+                    "Using PTM-aware dynamic batching for no-grad logprob only; "
+                    "actor_train keeps original-length dynamic batching."
                 )
 
         if self.args.use_rollout_routing_replay:

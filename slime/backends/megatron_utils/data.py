@@ -372,12 +372,16 @@ def get_data_iterator(
     model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
     force_single_sample_microbatch: bool = False,
+    enable_ptm_aware_dynamic_batching: bool | None = None,
 ) -> tuple[list[DataIterator], list[int]]:
     """
     Create iterators and a micro-batch schedule for a rollout step.
 
     - If `force_single_sample_microbatch` is True, each sample is assigned to its own
       micro-batch (primarily for no-grad logprob debugging/prototyping).
+    - `enable_ptm_aware_dynamic_batching` controls whether dynamic batching may use
+      PTM-compressed token estimates instead of original `total_lengths`. When unset,
+      the existing PTM capability checks decide automatically.
     - Else if `use_dynamic_batch_size` is False, splits into fixed-size contiguous
       micro-batches of `micro_batch_size`.
     - If True, computes the number of micro-batches per local step based on
@@ -571,13 +575,17 @@ def get_data_iterator(
         data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
     else:
         assert args.max_tokens_per_gpu is not None
-        use_ptm_sched = bool(
+        ptm_sched_supported = bool(
             args.slime_prefix_magi_attention
             and args.slime_prefix_tree_merging
             and args.qkv_format == "thd"
             and cp_size == 1
             and not args.allgather_cp
         )
+        if enable_ptm_aware_dynamic_batching is None:
+            use_ptm_sched = ptm_sched_supported
+        else:
+            use_ptm_sched = bool(enable_ptm_aware_dynamic_batching and ptm_sched_supported)
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
         token_budget = args.max_tokens_per_gpu * cp_size
