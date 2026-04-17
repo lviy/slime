@@ -19,6 +19,12 @@ Examples:
       --save-dir /tmp/ptm_speed
 
   python3 tests/test_ptm_forward_speed.py \
+      --rollout-pt /tmp/rollout_0.pt \
+      --num-rollout 3 \
+      --ptm-mode on \
+      --save-dir /tmp/ptm_speed
+
+  python3 tests/test_ptm_forward_speed.py \
       --model glm4.7-flash \
       --rollout-pt /tmp/rollout_0.pt \
       --ptm-mode on \
@@ -179,7 +185,9 @@ def build_parser() -> ArgumentParser:
         required=True,
         help=(
             "Path to a saved rollout .pt file, or a template containing "
-            "`{rollout_id}` (for example: /tmp/rollout_{rollout_id}.pt)."
+            "`{rollout_id}` (for example: /tmp/rollout_{rollout_id}.pt). "
+            "When --num-rollout > 1, a single indexed path such as /tmp/rollout_0.pt "
+            "will also be expanded automatically."
         ),
     )
     parser.add_argument("--num-rollout", type=int, default=DEFAULT_NUM_ROLLOUT, help=f"Number of rollout ids to consume. Default: {DEFAULT_NUM_ROLLOUT}.")
@@ -340,7 +348,39 @@ def _validate_rollout_pt_path(rollout_pt: str, num_rollout: int) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"Rollout .pt file does not exist: {rollout_pt}")
     if num_rollout != 1:
-        raise ValueError("--num-rollout must be 1 when --rollout-pt is a single file path without {rollout_id}.")
+        expanded_template = _expand_rollout_pt_template(rollout_pt)
+        if expanded_template is None:
+            raise ValueError(
+                "--num-rollout > 1 requires either a --rollout-pt template containing {rollout_id}, "
+                "or a single path ending with an indexed pattern such as rollout_0.pt."
+            )
+
+        missing = []
+        for rollout_id in range(num_rollout):
+            candidate = expanded_template.format(rollout_id=rollout_id)
+            if not Path(candidate).is_file():
+                missing.append(candidate)
+        if missing:
+            raise FileNotFoundError(
+                "Missing rollout .pt files inferred from the provided single-file path: " + ", ".join(missing)
+            )
+
+
+def _expand_rollout_pt_template(rollout_pt: str) -> str | None:
+    if "{rollout_id}" in rollout_pt:
+        return rollout_pt
+
+    path = Path(rollout_pt)
+    suffix = path.suffix
+    stem = path.stem
+    if "_" not in stem:
+        return None
+
+    prefix, maybe_index = stem.rsplit("_", 1)
+    if not maybe_index.isdigit():
+        return None
+
+    return str(path.with_name(f"{prefix}_{{rollout_id}}{suffix}"))
 
 
 def _runtime_env_vars() -> dict[str, str]:
@@ -469,6 +509,9 @@ def _apply_subsample(samples: list[dict], ratio: float | None) -> list[dict]:
 
 
 def _iter_rollout_paths(rollout_pt: str, num_rollout: int) -> list[str]:
+    expanded_template = _expand_rollout_pt_template(rollout_pt)
+    if expanded_template is not None and num_rollout > 1:
+        return [expanded_template.format(rollout_id=rollout_id) for rollout_id in range(num_rollout)]
     if "{rollout_id}" in rollout_pt:
         return [rollout_pt.format(rollout_id=rollout_id) for rollout_id in range(num_rollout)]
     return [rollout_pt]
@@ -549,9 +592,15 @@ def execute_phase3_only(
     save_debug_train_data: bool,
     ci_test: bool,
 ) -> float:
+    resolved_rollout_pt = _expand_rollout_pt_template(rollout_pt) if num_rollout > 1 else rollout_pt
+    if resolved_rollout_pt is None:
+        raise ValueError(
+            "Failed to resolve a multi-rollout template from --rollout-pt. "
+            "Please provide either a {rollout_id} template or an indexed path such as rollout_0.pt."
+        )
     phase_args = (
         f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode, tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size, expert_model_parallel_size, expert_tensor_parallel_size, max_tokens_per_gpu, decoder_last_pipeline_num_layers)} "
-        f"--load-debug-rollout-data {rollout_pt} "
+        f"--load-debug-rollout-data {resolved_rollout_pt} "
     )
     if ci_test:
         phase_args += "--ci-test "
@@ -564,7 +613,7 @@ def execute_phase3_only(
 
     print("=" * 80)
     print(f"Phase 3 speed run: {'PTM ON' if ptm_enabled else 'PTM OFF'}")
-    print(f"Rollout input: {rollout_pt}")
+    print(f"Rollout input: {resolved_rollout_pt}")
     print(f"Save dir: {save_dir}")
     print(f"HF checkpoint: {model_path}")
     print(f"Ref load: {ref_load}")
