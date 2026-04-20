@@ -66,6 +66,67 @@ class PrefixTreeBatchPlan:
     num_merged_tokens: int
 
 
+def summarize_prefix_tree_batch_plan(plan: PrefixTreeBatchPlan) -> dict[str, int | float]:
+    """Summarize PTM arbitrary-range metadata size for lightweight diagnostics."""
+
+    num_queries = int(plan.num_merged_tokens)
+    num_q_ranges = len(plan.q_ranges)
+    num_k_ranges = len(plan.k_ranges)
+    ranges_per_query = [0] * num_queries
+    total_q_range_tokens = 0
+    total_k_range_tokens = 0
+    max_q_range_width = 0
+    max_k_range_width = 0
+    q_range_pairs: list[tuple[int, int]] = []
+
+    for q_range, k_range in zip(plan.q_ranges, plan.k_ranges, strict=True):
+        q_start, q_end = int(q_range[0]), int(q_range[1])
+        k_start, k_end = int(k_range[0]), int(k_range[1])
+        q_width = max(q_end - q_start, 0)
+        k_width = max(k_end - k_start, 0)
+        q_range_pairs.append((q_start, q_end))
+
+        total_q_range_tokens += q_width
+        total_k_range_tokens += k_width
+        max_q_range_width = max(max_q_range_width, q_width)
+        max_k_range_width = max(max_k_range_width, k_width)
+
+        upper = min(q_end, num_queries)
+        for q_idx in range(max(q_start, 0), upper):
+            ranges_per_query[q_idx] += 1
+
+    queries_with_multiple_ranges = sum(1 for count in ranges_per_query if count > 1)
+    max_ranges_per_query = max(ranges_per_query, default=0)
+    unique_q_ranges = len(set(q_range_pairs))
+    duplicated_q_ranges = num_q_ranges - unique_q_ranges
+    q_ranges_non_overlapped = 1
+    sorted_q_range_pairs = sorted(q_range_pairs)
+    prev_end: int | None = None
+    for q_start, q_end in sorted_q_range_pairs:
+        if prev_end is not None and q_start < prev_end:
+            q_ranges_non_overlapped = 0
+            break
+        prev_end = q_end
+
+    return {
+        "num_q_ranges": num_q_ranges,
+        "num_k_ranges": num_k_ranges,
+        "num_unique_q_ranges": unique_q_ranges,
+        "num_duplicated_q_ranges": duplicated_q_ranges,
+        "q_ranges_non_overlapped": q_ranges_non_overlapped,
+        "avg_ranges_per_query": (num_q_ranges / num_queries) if num_queries > 0 else 0.0,
+        "max_ranges_per_query": max_ranges_per_query,
+        "queries_with_multiple_ranges": queries_with_multiple_ranges,
+        "total_q_range_tokens": total_q_range_tokens,
+        "total_k_range_tokens": total_k_range_tokens,
+        "avg_q_range_width": (total_q_range_tokens / num_q_ranges) if num_q_ranges > 0 else 0.0,
+        "avg_k_range_width": (total_k_range_tokens / num_k_ranges) if num_k_ranges > 0 else 0.0,
+        "avg_attended_tokens_per_query": (total_k_range_tokens / num_queries) if num_queries > 0 else 0.0,
+        "max_q_range_width": max_q_range_width,
+        "max_k_range_width": max_k_range_width,
+    }
+
+
 def get_prefix_tree_runtime_skip_reason(
     tokens: Sequence[Sequence[int] | Any],
     group_ids: Sequence[int | None] | None = None,

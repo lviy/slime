@@ -19,6 +19,7 @@ from slime.utils.prefix_tree_merging_utils import (
     build_prefix_tree_batch_plan,
     estimate_prefix_tree_merged_token_count,
     get_prefix_tree_runtime_skip_reason,
+    summarize_prefix_tree_batch_plan,
 )
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.timer import Timer
@@ -127,6 +128,7 @@ def get_batch(
                         "num_merged_tokens": ptm_plan.num_merged_tokens,
                     }
                 )
+                ptm_runtime_stats.update(summarize_prefix_tree_batch_plan(ptm_plan))
                 if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
                     device = tokens[0].device
                     dtype = tokens[0].dtype

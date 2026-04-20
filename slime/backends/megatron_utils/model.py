@@ -312,6 +312,25 @@ def forward_only(
                         "ptm_runtime_forward_tokens": ptm_runtime_stats["num_forward_tokens"],
                     }
                 )
+            for key in (
+                "num_q_ranges",
+                "num_k_ranges",
+                "num_unique_q_ranges",
+                "num_duplicated_q_ranges",
+                "q_ranges_non_overlapped",
+                "avg_ranges_per_query",
+                "max_ranges_per_query",
+                "queries_with_multiple_ranges",
+                "total_q_range_tokens",
+                "total_k_range_tokens",
+                "avg_q_range_width",
+                "avg_k_range_width",
+                "avg_attended_tokens_per_query",
+                "max_q_range_width",
+                "max_k_range_width",
+            ):
+                if key in ptm_runtime_stats:
+                    extra[f"ptm_runtime_{key}"] = ptm_runtime_stats[key]
             log_prefix_tree_context(
                 stage=prefix_tree_stage or (f"{store_prefix}logprobs"),
                 context=prefix_tree_context,
@@ -539,6 +558,25 @@ def train_one_step(
                         "ptm_runtime_forward_tokens": ptm_runtime_stats["num_forward_tokens"],
                     }
                 )
+            for key in (
+                "num_q_ranges",
+                "num_k_ranges",
+                "num_unique_q_ranges",
+                "num_duplicated_q_ranges",
+                "q_ranges_non_overlapped",
+                "avg_ranges_per_query",
+                "max_ranges_per_query",
+                "queries_with_multiple_ranges",
+                "total_q_range_tokens",
+                "total_k_range_tokens",
+                "avg_q_range_width",
+                "avg_k_range_width",
+                "avg_attended_tokens_per_query",
+                "max_q_range_width",
+                "max_k_range_width",
+            ):
+                if key in ptm_runtime_stats:
+                    extra[f"ptm_runtime_{key}"] = ptm_runtime_stats[key]
             log_prefix_tree_context(
                 stage=prefix_tree_stage or "train",
                 context=prefix_tree_context,

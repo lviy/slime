@@ -21,6 +21,7 @@ from slime.utils.prefix_tree_merging_utils import (
     build_prefix_tree_context_from_rollout_data,
     estimate_prefix_tree_merged_token_count,
     get_prefix_tree_runtime_skip_reason,
+    summarize_prefix_tree_batch_plan,
 )
 
 
@@ -295,6 +296,29 @@ def test_prefix_tree_batch_plan_merges_shared_prefixes() -> None:
     assert estimate_prefix_tree_merged_token_count(token_lists) == 7
     assert len(plan.unmerge_index) == plan.num_input_tokens
     assert len(plan.merged_tokens) == plan.num_merged_tokens
+
+
+@pytest.mark.unit
+def test_prefix_tree_batch_plan_summary_reports_range_density() -> None:
+    plan = build_prefix_tree_batch_plan(
+        [
+            [101, 11, 12, 13],
+            [101, 11, 12, 99],
+            [101, 11, 55],
+            [7, 8],
+        ]
+    )
+
+    summary = summarize_prefix_tree_batch_plan(plan)
+
+    assert summary["num_q_ranges"] == len(plan.q_ranges)
+    assert summary["num_k_ranges"] == len(plan.k_ranges)
+    assert summary["num_unique_q_ranges"] <= summary["num_q_ranges"]
+    assert summary["num_duplicated_q_ranges"] >= 0
+    assert summary["total_q_range_tokens"] >= plan.num_merged_tokens
+    assert summary["total_k_range_tokens"] >= plan.num_merged_tokens
+    assert summary["avg_ranges_per_query"] >= 1.0
+    assert summary["max_ranges_per_query"] >= 1
 
 
 @pytest.mark.unit
