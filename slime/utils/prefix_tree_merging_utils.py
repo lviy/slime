@@ -66,6 +66,20 @@ class PrefixTreeBatchPlan:
     num_merged_tokens: int
 
 
+def _merge_contiguous_intervals(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge tangent intervals into maximal contiguous segments."""
+
+    merged: list[tuple[int, int]] = []
+    for start, end in intervals:
+        start = int(start)
+        end = int(end)
+        if not merged or merged[-1][1] != start:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], end)
+    return merged
+
+
 def summarize_prefix_tree_batch_plan(plan: PrefixTreeBatchPlan) -> dict[str, int | float]:
     """Summarize PTM arbitrary-range metadata size for lightweight diagnostics."""
 
@@ -189,51 +203,50 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
         sample_paths.append(path)
 
     merged_tokens: list[int] = []
-    parent_indices: list[int] = []
+    q_ranges: list[list[int]] = []
+    k_ranges: list[list[int]] = []
+    attn_type_map: list[int] = []
 
     local_root.index = -1
-    stack = list(reversed(list(local_root.children.values())))
+    stack: list[tuple[_RuntimeTrieNode, tuple[tuple[int, int], ...]]] = [
+        (child, ()) for child in reversed(list(local_root.children.values()))
+    ]
     while stack:
-        node = stack.pop()
-        node.index = len(merged_tokens)
-        merged_tokens.append(int(node.token))
-        parent_index = node.parent.index if node.parent is not None else -1
-        parent_indices.append(int(parent_index))
-        if node.children:
-            stack.extend(reversed(list(node.children.values())))
+        start_node, ancestor_chain_intervals = stack.pop()
+
+        chain_nodes: list[_RuntimeTrieNode] = [start_node]
+        chain_tail = start_node
+        while len(chain_tail.children) == 1:
+            chain_tail = next(iter(chain_tail.children.values()))
+            chain_nodes.append(chain_tail)
+
+        chain_start = len(merged_tokens)
+        for node in chain_nodes:
+            node.index = len(merged_tokens)
+            merged_tokens.append(int(node.token))
+        chain_end = len(merged_tokens)
+
+        chain_interval = (chain_start, chain_end)
+        merged_path_segments = _merge_contiguous_intervals([*ancestor_chain_intervals, chain_interval])
+        for segment_start, segment_end in merged_path_segments[:-1]:
+            q_ranges.append([chain_start, chain_end])
+            k_ranges.append([segment_start, segment_end])
+            attn_type_map.append(0)
+
+        causal_start, causal_end = merged_path_segments[-1]
+        q_ranges.append([chain_start, chain_end])
+        k_ranges.append([causal_start, causal_end])
+        attn_type_map.append(1)
+
+        child_ancestor_intervals = (*ancestor_chain_intervals, chain_interval)
+        if chain_tail.children:
+            for child in reversed(list(chain_tail.children.values())):
+                stack.append((child, child_ancestor_intervals))
 
     unmerge_index: list[int] = []
     for path in sample_paths:
         indices = [node.index for node in path]
         unmerge_index.extend(indices)
-
-    q_ranges: list[list[int]] = []
-    k_ranges: list[list[int]] = []
-    attn_type_map: list[int] = []
-    for query_idx in range(len(merged_tokens)):
-        ancestor_indices: list[int] = []
-        cur = query_idx
-        while cur >= 0:
-            ancestor_indices.append(cur)
-            cur = parent_indices[cur]
-        ancestor_indices.sort()
-        if len(ancestor_indices) == 0:
-            continue
-
-        start = ancestor_indices[0]
-        prev = start
-        for idx in ancestor_indices[1:]:
-            if idx == prev + 1:
-                prev = idx
-                continue
-            q_ranges.append([query_idx, query_idx + 1])
-            k_ranges.append([start, prev + 1])
-            attn_type_map.append(0)
-            start = idx
-            prev = idx
-        q_ranges.append([query_idx, query_idx + 1])
-        k_ranges.append([start, prev + 1])
-        attn_type_map.append(0)
 
     num_input_tokens = sum(len(seq) for seq in sequences)
     return PrefixTreeBatchPlan(

@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from slime.utils.prefix_tree_merging_utils import (
+    PrefixTreeBatchPlan,
     build_prefix_group_metadata,
     build_prefix_tree_batch_plan,
     build_prefix_tree_context_from_rollout_data,
@@ -49,6 +50,102 @@ def _build_ptm_eval_prompts() -> list[str]:
         shared_prefix + "Compute 987 - 654 and give the final integer.",
         shared_prefix + "Compute 44 * 12 and give the final integer.",
     ]
+
+
+def _materialize_mask_from_plan(plan: PrefixTreeBatchPlan) -> torch.Tensor:
+    mask = torch.zeros((plan.num_merged_tokens, plan.num_merged_tokens), dtype=torch.bool)
+    for q_range, k_range, attn_type in zip(plan.q_ranges, plan.k_ranges, plan.attn_type_map, strict=True):
+        q_start, q_end = q_range
+        k_start, k_end = k_range
+        if attn_type == 0:
+            mask[q_start:q_end, k_start:k_end] = True
+            continue
+        if attn_type == 1:
+            q_len = q_end - q_start
+            k_len = k_end - k_start
+            assert q_len > 0
+            assert k_len >= q_len
+            right_align_offset = k_len - q_len
+            for row in range(q_len):
+                mask[q_start + row, k_start : k_start + right_align_offset + row + 1] = True
+            continue
+        raise AssertionError(f"Unsupported attn_type={attn_type}")
+    return mask
+
+
+def _build_legacy_token_level_plan(tokens: list[list[int]]) -> PrefixTreeBatchPlan:
+    sequences = [[int(x) for x in seq] for seq in tokens]
+    trie_children: dict[int, dict] = {}
+    sample_paths: list[list[dict]] = []
+
+    for seq in sequences:
+        node = trie_children
+        path: list[dict] = []
+        for token in seq:
+            child = node.get(token)
+            if child is None:
+                child = {"token": token, "children": {}, "index": -1, "parent": None}
+                node[token] = child
+            path.append(child)
+            node = child["children"]
+        sample_paths.append(path)
+
+    merged_tokens: list[int] = []
+    parent_indices: list[int] = []
+    stack: list[dict] = []
+    for child in reversed(list(trie_children.values())):
+        child["parent"] = None
+        stack.append(child)
+
+    while stack:
+        node = stack.pop()
+        node["index"] = len(merged_tokens)
+        merged_tokens.append(int(node["token"]))
+        parent = node["parent"]
+        parent_indices.append(-1 if parent is None else int(parent["index"]))
+        child_values = list(node["children"].values())
+        for child in reversed(child_values):
+            child["parent"] = node
+            stack.append(child)
+
+    unmerge_index: list[int] = []
+    for path in sample_paths:
+        unmerge_index.extend(int(node["index"]) for node in path)
+
+    q_ranges: list[list[int]] = []
+    k_ranges: list[list[int]] = []
+    attn_type_map: list[int] = []
+    for query_idx in range(len(merged_tokens)):
+        ancestor_indices: list[int] = []
+        cur = query_idx
+        while cur >= 0:
+            ancestor_indices.append(cur)
+            cur = parent_indices[cur]
+        ancestor_indices.sort()
+        start = ancestor_indices[0]
+        prev = start
+        for idx in ancestor_indices[1:]:
+            if idx == prev + 1:
+                prev = idx
+                continue
+            q_ranges.append([query_idx, query_idx + 1])
+            k_ranges.append([start, prev + 1])
+            attn_type_map.append(0)
+            start = idx
+            prev = idx
+        q_ranges.append([query_idx, query_idx + 1])
+        k_ranges.append([start, prev + 1])
+        attn_type_map.append(0)
+
+    return PrefixTreeBatchPlan(
+        merged_tokens=merged_tokens,
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_type_map=attn_type_map,
+        unmerge_index=unmerge_index,
+        num_input_tokens=sum(len(seq) for seq in sequences),
+        num_merged_tokens=len(merged_tokens),
+    )
 
 
 def _install_forward_only_import_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -319,6 +416,45 @@ def test_prefix_tree_batch_plan_summary_reports_range_density() -> None:
     assert summary["total_k_range_tokens"] >= plan.num_merged_tokens
     assert summary["avg_ranges_per_query"] >= 1.0
     assert summary["max_ranges_per_query"] >= 1
+
+
+@pytest.mark.unit
+def test_prefix_tree_batch_plan_preserves_tree_attention_mask() -> None:
+    token_lists = [
+        [101, 11, 12, 13],
+        [101, 11, 12, 99],
+        [101, 11, 55],
+        [7, 8],
+        [7, 9, 10],
+    ]
+
+    new_plan = build_prefix_tree_batch_plan(token_lists)
+    legacy_plan = _build_legacy_token_level_plan(token_lists)
+
+    assert new_plan.merged_tokens == legacy_plan.merged_tokens
+    assert new_plan.unmerge_index == legacy_plan.unmerge_index
+    assert torch.equal(_materialize_mask_from_plan(new_plan), _materialize_mask_from_plan(legacy_plan))
+
+
+@pytest.mark.unit
+def test_prefix_tree_batch_plan_reduces_range_fragmentation_vs_legacy() -> None:
+    token_lists = [
+        [101, 11, 12, 13],
+        [101, 11, 12, 99],
+        [101, 11, 55],
+        [7, 8],
+        [7, 9, 10],
+    ]
+
+    new_plan = build_prefix_tree_batch_plan(token_lists)
+    legacy_plan = _build_legacy_token_level_plan(token_lists)
+    new_summary = summarize_prefix_tree_batch_plan(new_plan)
+    legacy_summary = summarize_prefix_tree_batch_plan(legacy_plan)
+
+    assert new_summary["num_q_ranges"] < legacy_summary["num_q_ranges"]
+    assert new_summary["num_unique_q_ranges"] < legacy_summary["num_unique_q_ranges"]
+    assert new_summary["total_k_range_tokens"] <= legacy_summary["total_k_range_tokens"]
+    assert new_summary["max_q_range_width"] > 1
 
 
 @pytest.mark.unit
