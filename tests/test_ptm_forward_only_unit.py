@@ -20,6 +20,7 @@ from slime.utils.prefix_tree_merging_utils import (
     build_prefix_tree_batch_plan,
     build_prefix_tree_context_from_rollout_data,
     estimate_prefix_tree_merged_token_count,
+    get_prefix_tree_runtime_skip_reason,
 )
 
 
@@ -294,6 +295,42 @@ def test_prefix_tree_batch_plan_merges_shared_prefixes() -> None:
     assert estimate_prefix_tree_merged_token_count(token_lists) == 7
     assert len(plan.unmerge_index) == plan.num_input_tokens
     assert len(plan.merged_tokens) == plan.num_merged_tokens
+
+
+@pytest.mark.unit
+def test_prefix_tree_runtime_skip_reason_single_sample_microbatch() -> None:
+    reason = get_prefix_tree_runtime_skip_reason(
+        [torch.tensor([101, 11, 12, 13], dtype=torch.long)],
+        group_ids=[0],
+    )
+
+    assert reason == "single_sample_microbatch"
+
+
+@pytest.mark.unit
+def test_prefix_tree_runtime_skip_reason_no_mergeable_group_overlap() -> None:
+    reason = get_prefix_tree_runtime_skip_reason(
+        [
+            torch.tensor([101, 11, 12, 13], dtype=torch.long),
+            torch.tensor([101, 11, 12, 99], dtype=torch.long),
+        ],
+        group_ids=[0, 1],
+    )
+
+    assert reason == "no_mergeable_group_overlap"
+
+
+@pytest.mark.unit
+def test_prefix_tree_runtime_skip_reason_allows_repeated_group() -> None:
+    reason = get_prefix_tree_runtime_skip_reason(
+        [
+            torch.tensor([101, 11, 12, 13], dtype=torch.long),
+            torch.tensor([101, 11, 12, 99], dtype=torch.long),
+        ],
+        group_ids=[0, 0],
+    )
+
+    assert reason is None
 
 
 if __name__ == "__main__":

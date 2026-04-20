@@ -66,6 +66,39 @@ class PrefixTreeBatchPlan:
     num_merged_tokens: int
 
 
+def get_prefix_tree_runtime_skip_reason(
+    tokens: Sequence[Sequence[int] | Any],
+    group_ids: Sequence[int | None] | None = None,
+) -> str | None:
+    """Return a cheap PTM runtime skip reason before building the full batch plan.
+
+    This only uses micro-batch cardinality and local PTM group overlap metadata.
+    It intentionally avoids any trie construction so the check stays cheap.
+    """
+
+    if len(tokens) <= 1:
+        return "single_sample_microbatch"
+
+    if group_ids is None:
+        return None
+
+    mergeable_group_ids: list[int] = []
+    for gid in group_ids:
+        if gid is None:
+            continue
+        gid = int(gid)
+        if gid >= 0:
+            mergeable_group_ids.append(gid)
+
+    if len(mergeable_group_ids) < 2:
+        return "no_mergeable_group_overlap"
+
+    if len(set(mergeable_group_ids)) == len(mergeable_group_ids):
+        return "no_mergeable_group_overlap"
+
+    return None
+
+
 def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> PrefixTreeBatchPlan:
     sequences: list[list[int]] = [_as_int_list(t) for t in tokens]
     if len(sequences) == 0:

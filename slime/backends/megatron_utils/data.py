@@ -15,7 +15,11 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
-from slime.utils.prefix_tree_merging_utils import build_prefix_tree_batch_plan, estimate_prefix_tree_merged_token_count
+from slime.utils.prefix_tree_merging_utils import (
+    build_prefix_tree_batch_plan,
+    estimate_prefix_tree_merged_token_count,
+    get_prefix_tree_runtime_skip_reason,
+)
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.timer import Timer
 from slime.utils.types import RolloutBatch
@@ -65,6 +69,7 @@ def get_batch(
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
     tokens = batch["tokens"]
+    group_ids = batch.get("ptm_group_ids")
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -111,48 +116,52 @@ def get_batch(
         else:
             ptm_profile_start = None
         if enable_ptm_now:
-            ptm_plan = build_prefix_tree_batch_plan(tokens)
-            ptm_runtime_stats.update(
-                {
-                    "num_input_tokens": ptm_plan.num_input_tokens,
-                    "num_merged_tokens": ptm_plan.num_merged_tokens,
-                }
-            )
-            if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
-                device = tokens[0].device
-                dtype = tokens[0].dtype
-                merged_tokens = torch.tensor(ptm_plan.merged_tokens, dtype=dtype, device=device)
-                # PTM still runs in THD/CP=1 mode, but TP/sequence parallel may require
-                # the token stream length to be padded to a TP-aligned multiple.
-                ptm_pad = (pad_size - merged_tokens.size(0) % pad_size) % pad_size if tp_size > 1 else 0
-                if ptm_pad != 0:
-                    merged_tokens = F.pad(merged_tokens, (0, ptm_pad), value=pad_token_id)
-                cu_seqlens = torch.tensor(
-                    [0, merged_tokens.size(0)], dtype=torch.int, device=torch.cuda.current_device()
+            cheap_skip_reason = get_prefix_tree_runtime_skip_reason(tokens, group_ids=group_ids)
+            if cheap_skip_reason is not None:
+                ptm_runtime_stats["skip_reason"] = cheap_skip_reason
+            else:
+                ptm_plan = build_prefix_tree_batch_plan(tokens)
+                ptm_runtime_stats.update(
+                    {
+                        "num_input_tokens": ptm_plan.num_input_tokens,
+                        "num_merged_tokens": ptm_plan.num_merged_tokens,
+                    }
                 )
-                max_seqlen = merged_tokens.size(0)
-                packed_seq_params = PackedSeqParams(
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_kv=cu_seqlens,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_kv=max_seqlen,
-                    qkv_format="thd",
-                    ptm_q_ranges=torch.tensor(
-                        ptm_plan.q_ranges, dtype=torch.int32, device=torch.cuda.current_device()
-                    ),
-                    ptm_k_ranges=torch.tensor(
-                        ptm_plan.k_ranges, dtype=torch.int32, device=torch.cuda.current_device()
-                    ),
-                    ptm_attn_type_map=torch.tensor(
-                        ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
-                    ),
-                )
-                tokens = merged_tokens.unsqueeze(0)
-                batch["ptm_unmerge_index"] = torch.tensor(
-                    ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
-                )
-                ptm_runtime_stats.update({"applied": True, "skip_reason": "applied"})
-                ptm_applied = True
+                if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
+                    device = tokens[0].device
+                    dtype = tokens[0].dtype
+                    merged_tokens = torch.tensor(ptm_plan.merged_tokens, dtype=dtype, device=device)
+                    # PTM still runs in THD/CP=1 mode, but TP/sequence parallel may require
+                    # the token stream length to be padded to a TP-aligned multiple.
+                    ptm_pad = (pad_size - merged_tokens.size(0) % pad_size) % pad_size if tp_size > 1 else 0
+                    if ptm_pad != 0:
+                        merged_tokens = F.pad(merged_tokens, (0, ptm_pad), value=pad_token_id)
+                    cu_seqlens = torch.tensor(
+                        [0, merged_tokens.size(0)], dtype=torch.int, device=torch.cuda.current_device()
+                    )
+                    max_seqlen = merged_tokens.size(0)
+                    packed_seq_params = PackedSeqParams(
+                        cu_seqlens_q=cu_seqlens,
+                        cu_seqlens_kv=cu_seqlens,
+                        max_seqlen_q=max_seqlen,
+                        max_seqlen_kv=max_seqlen,
+                        qkv_format="thd",
+                        ptm_q_ranges=torch.tensor(
+                            ptm_plan.q_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                        ),
+                        ptm_k_ranges=torch.tensor(
+                            ptm_plan.k_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                        ),
+                        ptm_attn_type_map=torch.tensor(
+                            ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
+                        ),
+                    )
+                    tokens = merged_tokens.unsqueeze(0)
+                    batch["ptm_unmerge_index"] = torch.tensor(
+                        ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
+                    )
+                    ptm_runtime_stats.update({"applied": True, "skip_reason": "applied"})
+                    ptm_applied = True
         if ptm_profile_start is not None:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
