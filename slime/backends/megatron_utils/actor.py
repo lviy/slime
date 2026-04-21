@@ -23,6 +23,7 @@ from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.prefix_tree_merging_utils import (
     build_prefix_tree_context_from_rollout_data,
+    format_ptm_debug_timing_metrics,
     is_ptm_debug_enabled,
     log_prefix_tree_context,
 )
@@ -103,7 +104,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if role == "critic":
             if self.args.offload_train:
-                self.sleep()
+                self.sleep(reason="after_init")
             return start_rollout_id
 
         self.weights_backuper = TensorBackuper.create(
@@ -153,7 +154,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
-            self.sleep()
+            self.sleep(reason="after_init")
 
         self.rollout_engines = None
 
@@ -167,51 +168,116 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return start_rollout_id
 
+    def _log_ptm_debug_offload_transition(
+        self,
+        transition: str,
+        timings: dict[str, float],
+        total_time: float,
+        reason: str,
+    ) -> None:
+        if not is_ptm_debug_enabled():
+            return
+
+        role = getattr(self, "role", None)
+        rank = getattr(self.args, "rank", getattr(self, "_rank", None))
+        extra_metrics = {
+            "transition": transition,
+            "reason": reason,
+            "rank": int(rank) if rank is not None else None,
+            "role": role,
+            "call_idx": int(getattr(self, f"_{transition}_call_idx", 0)),
+            f"perf/{transition}_time": total_time,
+        }
+        logger.info(
+            f"[PTMDebug] {transition} breakdown: "
+            f"{format_ptm_debug_timing_metrics(timings, extra_metrics=extra_metrics)}"
+        )
+
     @timer
-    def sleep(self) -> None:
+    def sleep(self, reason: str = "unspecified") -> None:
         assert self.args.offload_train
 
         ptm_debug_enabled = is_ptm_debug_enabled()
+        if ptm_debug_enabled:
+            self._sleep_call_idx = getattr(self, "_sleep_call_idx", 0) + 1
+            sleep_total_start = perf_counter()
+            sleep_timings: dict[str, float] = {}
+        else:
+            sleep_total_start = None
+            sleep_timings = {}
 
         clear_memory_start = perf_counter() if ptm_debug_enabled else None
         clear_memory(clear_host_memory=True)
         if clear_memory_start is not None:
-            Timer().add("sleep_clear_memory", perf_counter() - clear_memory_start)
+            elapsed = perf_counter() - clear_memory_start
+            Timer().add("sleep_clear_memory", elapsed)
+            sleep_timings["sleep_clear_memory"] = elapsed
         print_memory("before offload model")
 
         destroy_pg_start = perf_counter() if ptm_debug_enabled else None
         destroy_process_groups()
         if destroy_pg_start is not None:
-            Timer().add("sleep_destroy_process_groups", perf_counter() - destroy_pg_start)
+            elapsed = perf_counter() - destroy_pg_start
+            Timer().add("sleep_destroy_process_groups", elapsed)
+            sleep_timings["sleep_destroy_process_groups"] = elapsed
 
         pause_start = perf_counter() if ptm_debug_enabled else None
         torch_memory_saver.pause()
         if pause_start is not None:
-            Timer().add("sleep_torch_memory_saver_pause", perf_counter() - pause_start)
+            elapsed = perf_counter() - pause_start
+            Timer().add("sleep_torch_memory_saver_pause", elapsed)
+            sleep_timings["sleep_torch_memory_saver_pause"] = elapsed
 
         print_memory("after offload model")
+        if sleep_total_start is not None:
+            self._log_ptm_debug_offload_transition(
+                transition="sleep",
+                timings=sleep_timings,
+                total_time=perf_counter() - sleep_total_start,
+                reason=reason,
+            )
 
     @timer
-    def wake_up(self) -> None:
+    def wake_up(self, reason: str = "unspecified") -> None:
         assert self.args.offload_train
         ptm_debug_enabled = is_ptm_debug_enabled()
+        if ptm_debug_enabled:
+            self._wake_up_call_idx = getattr(self, "_wake_up_call_idx", 0) + 1
+            wake_total_start = perf_counter()
+            wake_timings: dict[str, float] = {}
+        else:
+            wake_total_start = None
+            wake_timings = {}
         print_memory("before wake_up model")
 
         resume_start = perf_counter() if ptm_debug_enabled else None
         torch_memory_saver.resume()
         if resume_start is not None:
-            Timer().add("wake_up_torch_memory_saver_resume", perf_counter() - resume_start)
+            elapsed = perf_counter() - resume_start
+            Timer().add("wake_up_torch_memory_saver_resume", elapsed)
+            wake_timings["wake_up_torch_memory_saver_resume"] = elapsed
 
         clear_memory_start = perf_counter() if ptm_debug_enabled else None
         clear_memory()
         if clear_memory_start is not None:
-            Timer().add("wake_up_clear_memory", perf_counter() - clear_memory_start)
+            elapsed = perf_counter() - clear_memory_start
+            Timer().add("wake_up_clear_memory", elapsed)
+            wake_timings["wake_up_clear_memory"] = elapsed
 
         reload_pg_start = perf_counter() if ptm_debug_enabled else None
         reload_process_groups()
         if reload_pg_start is not None:
-            Timer().add("wake_up_reload_process_groups", perf_counter() - reload_pg_start)
+            elapsed = perf_counter() - reload_pg_start
+            Timer().add("wake_up_reload_process_groups", elapsed)
+            wake_timings["wake_up_reload_process_groups"] = elapsed
         print_memory("after wake_up model")
+        if wake_total_start is not None:
+            self._log_ptm_debug_offload_transition(
+                transition="wake_up",
+                timings=wake_timings,
+                total_time=perf_counter() - wake_total_start,
+                reason=reason,
+            )
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
@@ -398,7 +464,7 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         if self.args.offload_train:
-            self.wake_up()
+            self.wake_up(reason="before_train")
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)

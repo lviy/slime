@@ -38,11 +38,11 @@ def add_ptm_debug_timing(
 
 def format_ptm_debug_timing_metrics(
     timings: dict[str, float],
-    extra_metrics: dict[str, int | float] | None = None,
-) -> dict[str, int | float]:
+    extra_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Format PTM debug timings into log-friendly metric names."""
 
-    metrics: dict[str, int | float] = {f"perf/{metric_name}_time": elapsed for metric_name, elapsed in timings.items()}
+    metrics: dict[str, Any] = {f"perf/{metric_name}_time": elapsed for metric_name, elapsed in timings.items()}
     if extra_metrics:
         metrics.update(extra_metrics)
     return metrics

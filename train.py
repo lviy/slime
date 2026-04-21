@@ -54,11 +54,11 @@ def train(args):
     def offload_train(rollout_id):
         if args.offload_train:
             if args.use_critic:
-                critic_model.offload()
+                critic_model.offload(reason="post_train_offload")
                 if rollout_id >= args.num_critic_only_steps and not args.critic_train_only:
-                    actor_model.offload()
+                    actor_model.offload(reason="post_train_offload")
             else:
-                actor_model.offload()
+                actor_model.offload(reason="post_train_offload")
         else:
             if args.critic_train_only:
                 critic_model.clear_memory()

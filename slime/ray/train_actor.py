@@ -99,11 +99,11 @@ class TrainRayActor(RayActor):
         print_memory("after TrainRayActor.clear_memory")
 
     @abc.abstractmethod
-    def sleep(self, tags):
+    def sleep(self, reason: str = "unspecified"):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def wake_up(self, tags):
+    def wake_up(self, reason: str = "unspecified"):
         raise NotImplementedError
 
     @abc.abstractmethod
