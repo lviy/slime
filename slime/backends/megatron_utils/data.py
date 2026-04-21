@@ -1,5 +1,6 @@
 import logging
 import os
+from bisect import bisect_left
 from argparse import Namespace
 from collections.abc import Sequence
 from time import perf_counter
@@ -16,8 +17,8 @@ from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.prefix_tree_merging_utils import (
+    PrefixTreeScheduleContext,
     build_prefix_tree_batch_plan,
-    estimate_prefix_tree_merged_token_count,
     get_prefix_tree_runtime_skip_reason,
     summarize_prefix_tree_batch_plan,
 )
@@ -480,16 +481,11 @@ def get_data_iterator(
             data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
         return data_iterator
 
-    def _estimate_ptm_sched_tokens(sample_indices: list[int]) -> int:
-        token_source = rollout_data.get("tokens_cpu", rollout_data["tokens"])
-        token_slices = [
-            token_source[sample_idx][: rollout_data["total_lengths"][sample_idx]]
-            for sample_idx in sample_indices
-        ]
-        merged_tokens = estimate_prefix_tree_merged_token_count(token_slices)
+    pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+
+    def _pad_ptm_sched_tokens(merged_tokens: int) -> int:
         if merged_tokens <= 0:
             return 0
-        pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
         return merged_tokens + ((pad_size - merged_tokens % pad_size) % pad_size)
 
     ptm_sched_metrics: dict[str, int | float] = {
@@ -502,12 +498,61 @@ def get_data_iterator(
         "reused_first_pass_steps": 0,
     }
 
+    class _ScheduleBucket:
+        __slots__ = ("sample_indices", "sorted_ranks", "merged_tokens", "padded_tokens")
+
+        def __init__(self, sample_idx: int, schedule_ctx: PrefixTreeScheduleContext):
+            rank = schedule_ctx.get_rank(sample_idx)
+            merged_tokens = schedule_ctx.get_length(sample_idx)
+            self.sample_indices = [int(sample_idx)]
+            self.sorted_ranks = [rank]
+            self.merged_tokens = merged_tokens
+            self.padded_tokens = _pad_ptm_sched_tokens(merged_tokens)
+
+        def evaluate_insert(
+            self,
+            sample_idx: int,
+            schedule_ctx: PrefixTreeScheduleContext,
+        ) -> tuple[int, int, int]:
+            rank = schedule_ctx.get_rank(sample_idx)
+            insert_at = bisect_left(self.sorted_ranks, rank)
+
+            prev_rank = self.sorted_ranks[insert_at - 1] if insert_at > 0 else None
+            next_rank = self.sorted_ranks[insert_at] if insert_at < len(self.sorted_ranks) else None
+
+            merged_tokens = self.merged_tokens + schedule_ctx.get_length(sample_idx)
+            if prev_rank is not None:
+                merged_tokens -= schedule_ctx.get_lcp_by_rank(prev_rank, rank)
+            if next_rank is not None:
+                merged_tokens -= schedule_ctx.get_lcp_by_rank(rank, next_rank)
+            if prev_rank is not None and next_rank is not None:
+                merged_tokens += schedule_ctx.get_lcp_by_rank(prev_rank, next_rank)
+
+            padded_tokens = _pad_ptm_sched_tokens(merged_tokens)
+            return padded_tokens, merged_tokens, insert_at
+
+        def commit_insert(
+            self,
+            sample_idx: int,
+            schedule_ctx: PrefixTreeScheduleContext,
+            padded_tokens: int | None = None,
+            merged_tokens: int | None = None,
+            insert_at: int | None = None,
+        ) -> None:
+            if padded_tokens is None or merged_tokens is None or insert_at is None:
+                padded_tokens, merged_tokens, insert_at = self.evaluate_insert(sample_idx, schedule_ctx)
+            self.sample_indices.append(int(sample_idx))
+            self.sample_indices.sort()
+            self.sorted_ranks.insert(int(insert_at), schedule_ctx.get_rank(sample_idx))
+            self.merged_tokens = int(merged_tokens)
+            self.padded_tokens = int(padded_tokens)
+
     def _build_ptm_aware_microbatches(
         step_indices: list[int],
         token_budget: int,
         target_num_mbs: int,
         require_exact_count: bool = False,
-        cost_cache: dict[tuple[int, ...], int] | None = None,
+        schedule_ctx: PrefixTreeScheduleContext | None = None,
     ) -> list[list[int]]:
         if not step_indices:
             return []
@@ -520,7 +565,8 @@ def get_data_iterator(
         total_lengths = rollout_data["total_lengths"]
         group_sizes = rollout_data.get("ptm_group_sizes")
         prefix_lens = rollout_data.get("ptm_prefix_lens")
-        cost_cache = {} if cost_cache is None else cost_cache
+        if schedule_ctx is None:
+            raise ValueError("schedule_ctx is required for PTM-aware dynamic batching")
         ptm_sched_metrics["build_calls"] += 1
 
         def _prefix_len(sample_idx: int) -> int:
@@ -536,20 +582,6 @@ def get_data_iterator(
         def _suffix_len(sample_idx: int) -> int:
             return max(int(total_lengths[sample_idx]) - _prefix_len(sample_idx), 0)
 
-        def _estimate_cached(sample_indices: list[int]) -> int:
-            key = tuple(sorted(sample_indices))
-            ptm_sched_metrics["estimate_calls"] += 1
-            cached = cost_cache.get(key)
-            if cached is not None:
-                ptm_sched_metrics["estimate_cache_hits"] += 1
-                return cached
-            ptm_sched_metrics["estimate_cache_misses"] += 1
-            estimate_start_time = perf_counter()
-            cost = int(_estimate_ptm_sched_tokens(list(key)))
-            ptm_sched_metrics["estimate_time_s"] += perf_counter() - estimate_start_time
-            cost_cache[key] = cost
-            return cost
-
         prioritized = sorted(
             step_indices,
             key=lambda idx: (
@@ -561,38 +593,41 @@ def get_data_iterator(
             ),
         )
 
-        microbatches: list[list[int]] = []
-        microbatch_costs: list[int] = []
+        buckets: list[_ScheduleBucket] = []
 
         for position, sample_idx in enumerate(prioritized):
             remaining_samples = len(prioritized) - position
-            remaining_buckets_to_open = target_num_mbs - len(microbatches)
+            remaining_buckets_to_open = target_num_mbs - len(buckets)
             force_open_new_bucket = (
                 require_exact_count
-                and len(microbatches) < target_num_mbs
+                and len(buckets) < target_num_mbs
                 and remaining_samples == remaining_buckets_to_open
             )
 
             if force_open_new_bucket:
-                microbatches.append([sample_idx])
-                microbatch_costs.append(_estimate_cached([sample_idx]))
+                buckets.append(_ScheduleBucket(sample_idx, schedule_ctx))
                 continue
 
-            feasible_candidates: list[tuple[int, int, int, int, int]] = []
-            overflow_candidates: list[tuple[int, int, int, int, int]] = []
+            feasible_candidates: list[tuple[int, int, int, int, int, int, int]] = []
+            overflow_candidates: list[tuple[int, int, int, int, int, int, int]] = []
 
-            for slot_idx, existing in enumerate(microbatches):
+            for slot_idx, bucket in enumerate(buckets):
                 ptm_sched_metrics["candidate_evals"] += 1
-                candidate = existing + [sample_idx]
-                candidate_cost = _estimate_cached(candidate)
-                marginal_cost = candidate_cost - microbatch_costs[slot_idx]
+                estimate_start_time = perf_counter()
+                candidate_cost, merged_tokens, insert_at = bucket.evaluate_insert(sample_idx, schedule_ctx)
+                ptm_sched_metrics["estimate_time_s"] += perf_counter() - estimate_start_time
+                ptm_sched_metrics["estimate_calls"] += 1
+                ptm_sched_metrics["estimate_cache_misses"] += 1
+                marginal_cost = candidate_cost - bucket.padded_tokens
                 slack = token_budget - candidate_cost
                 candidate_info = (
                     slot_idx,
                     candidate_cost,
                     marginal_cost,
                     slack,
-                    len(existing),
+                    len(bucket.sample_indices),
+                    merged_tokens,
+                    insert_at,
                 )
                 if candidate_cost <= token_budget:
                     feasible_candidates.append(candidate_info)
@@ -600,7 +635,7 @@ def get_data_iterator(
                     overflow_candidates.append(candidate_info)
 
             if feasible_candidates:
-                best_slot, best_cost, _, _, _ = min(
+                best_slot, best_cost, _, _, _, best_merged_tokens, best_insert_at = min(
                     feasible_candidates,
                     key=lambda item: (
                         item[2],
@@ -609,19 +644,23 @@ def get_data_iterator(
                         item[0],
                     ),
                 )
-                microbatches[best_slot].append(sample_idx)
-                microbatch_costs[best_slot] = int(best_cost)
+                buckets[best_slot].commit_insert(
+                    sample_idx,
+                    schedule_ctx,
+                    padded_tokens=best_cost,
+                    merged_tokens=best_merged_tokens,
+                    insert_at=best_insert_at,
+                )
                 continue
 
-            if len(microbatches) < target_num_mbs:
-                microbatches.append([sample_idx])
-                microbatch_costs.append(_estimate_cached([sample_idx]))
+            if len(buckets) < target_num_mbs:
+                buckets.append(_ScheduleBucket(sample_idx, schedule_ctx))
                 continue
 
             if not overflow_candidates:
                 raise RuntimeError("PTM scheduler could not place sample into any existing bucket.")
 
-            best_slot, best_cost, _, _, _ = min(
+            best_slot, best_cost, _, _, _, best_merged_tokens, best_insert_at = min(
                 overflow_candidates,
                 key=lambda item: (
                     item[1] - token_budget,
@@ -630,10 +669,15 @@ def get_data_iterator(
                     item[0],
                 ),
             )
-            microbatches[best_slot].append(sample_idx)
-            microbatch_costs[best_slot] = int(best_cost)
+            buckets[best_slot].commit_insert(
+                sample_idx,
+                schedule_ctx,
+                padded_tokens=best_cost,
+                merged_tokens=best_merged_tokens,
+                insert_at=best_insert_at,
+            )
 
-        partitions = [sorted(mb) for mb in microbatches if mb]
+        partitions = [bucket.sample_indices.copy() for bucket in buckets if bucket.sample_indices]
         if require_exact_count:
             assert len(partitions) == target_num_mbs, f"{len(partitions)} != {target_num_mbs}"
         return partitions
@@ -670,22 +714,22 @@ def get_data_iterator(
         ptm_sched_first_pass_elapsed = 0.0
         ptm_sched_second_pass_elapsed = 0.0
         first_pass_partitions: list[list[list[int]] | None] = [None] * num_steps_per_rollout
-        step_cost_caches: list[dict[tuple[int, ...], int] | None] = [None] * num_steps_per_rollout
+        step_schedule_contexts = rollout_data.get("ptm_schedule_contexts")
         first_pass_start_time = perf_counter()
         for i in range(num_steps_per_rollout):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             if use_ptm_sched:
                 step_indices = list(range(start, end))
-                step_cost_cache: dict[tuple[int, ...], int] = {}
+                if step_schedule_contexts is None or i >= len(step_schedule_contexts):
+                    raise ValueError(f"Missing ptm_schedule_contexts for step {i}")
                 step_partitions = _build_ptm_aware_microbatches(
                     step_indices,
                     token_budget,
                     target_num_mbs=len(step_indices),
                     require_exact_count=False,
-                    cost_cache=step_cost_cache,
+                    schedule_ctx=step_schedule_contexts[i],
                 )
                 first_pass_partitions[i] = step_partitions
-                step_cost_caches[i] = step_cost_cache
                 num_microbatches.append(len(step_partitions))
             else:
                 num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], token_budget))
@@ -716,12 +760,14 @@ def get_data_iterator(
                     partitions = [partition.copy() for partition in local_first_pass_partitions]
                     ptm_sched_metrics["reused_first_pass_steps"] += 1
                 else:
+                    if step_schedule_contexts is None or i >= len(step_schedule_contexts):
+                        raise ValueError(f"Missing ptm_schedule_contexts for step {i}")
                     partitions = _build_ptm_aware_microbatches(
                         step_indices,
                         token_budget,
                         target_num_mbs=target_num_mbs,
                         require_exact_count=True,
-                        cost_cache=step_cost_caches[i],
+                        schedule_ctx=step_schedule_contexts[i],
                     )
                 micro_batch_indices.extend(partitions)
         else:

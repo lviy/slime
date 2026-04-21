@@ -43,6 +43,16 @@ class _TrieNode:
 
 
 @dataclass
+class _ScheduleTrieNode:
+    children: dict[int, "_ScheduleTrieNode"]
+    terminal_sample_ids: list[int]
+
+    @staticmethod
+    def root() -> "_ScheduleTrieNode":
+        return _ScheduleTrieNode(children={}, terminal_sample_ids=[])
+
+
+@dataclass
 class _RuntimeTrieNode:
     token: int | None
     parent: "_RuntimeTrieNode | None"
@@ -67,6 +77,47 @@ class PrefixTreeBatchPlan:
     num_merged_tokens: int
 
 
+@dataclass
+class PrefixTreeScheduleContext:
+    sample_lengths: dict[int, int]
+    sample_ranks: dict[int, int]
+    rank_to_sample: list[int]
+    adjacent_lcps: list[int]
+    lcp_sparse_table: list[list[int]]
+    lcp_log2: list[int]
+
+    @property
+    def num_samples(self) -> int:
+        return len(self.rank_to_sample)
+
+    def get_length(self, sample_idx: int) -> int:
+        return int(self.sample_lengths[int(sample_idx)])
+
+    def get_rank(self, sample_idx: int) -> int:
+        return int(self.sample_ranks[int(sample_idx)])
+
+    def get_lcp(self, sample_idx_a: int, sample_idx_b: int) -> int:
+        return self.get_lcp_by_rank(self.get_rank(sample_idx_a), self.get_rank(sample_idx_b))
+
+    def get_lcp_by_rank(self, rank_a: int, rank_b: int) -> int:
+        rank_a = int(rank_a)
+        rank_b = int(rank_b)
+        if rank_a == rank_b:
+            return self.get_length(self.rank_to_sample[rank_a])
+
+        left = min(rank_a, rank_b)
+        right = max(rank_a, rank_b) - 1
+        if not self.adjacent_lcps:
+            return 0
+
+        width = right - left + 1
+        level = self.lcp_log2[width]
+        return min(
+            self.lcp_sparse_table[level][left],
+            self.lcp_sparse_table[level][right - (1 << level) + 1],
+        )
+
+
 def _merge_contiguous_intervals(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge tangent intervals into maximal contiguous segments."""
 
@@ -79,6 +130,100 @@ def _merge_contiguous_intervals(intervals: Sequence[tuple[int, int]]) -> list[tu
             continue
         merged[-1] = (merged[-1][0], end)
     return merged
+
+
+def _longest_common_prefix(seq_a: Sequence[int], seq_b: Sequence[int]) -> int:
+    matched = 0
+    for token_a, token_b in zip(seq_a, seq_b, strict=False):
+        if int(token_a) != int(token_b):
+            break
+        matched += 1
+    return matched
+
+
+def build_prefix_tree_schedule_context(
+    tokens: Sequence[Sequence[int] | Any],
+    sample_ids: Sequence[int] | None = None,
+) -> PrefixTreeScheduleContext:
+    """Build an exact PTM schedule context for one local rollout step.
+
+    The context is used by the PTM-aware dynamic batching planner. It constructs
+    a single global trie for the step, emits samples in trie-derived lexicographic
+    order, and precomputes RMQ over adjacent LCPs so bucket insertion costs can
+    be updated exactly from predecessor/successor relationships.
+    """
+
+    if sample_ids is None:
+        sample_ids = list(range(len(tokens)))
+    else:
+        sample_ids = [int(sample_idx) for sample_idx in sample_ids]
+
+    if len(tokens) != len(sample_ids):
+        raise ValueError(f"tokens/sample_ids length mismatch: {len(tokens)} vs {len(sample_ids)}")
+
+    root = _ScheduleTrieNode.root()
+    sequences_by_sample: dict[int, list[int]] = {}
+    sample_lengths: dict[int, int] = {}
+
+    for sample_idx, seq_like in zip(sample_ids, tokens, strict=True):
+        seq = _as_int_list(seq_like)
+        sequences_by_sample[sample_idx] = seq
+        sample_lengths[sample_idx] = len(seq)
+
+        node = root
+        for token in seq:
+            child = node.children.get(token)
+            if child is None:
+                child = _ScheduleTrieNode(children={}, terminal_sample_ids=[])
+                node.children[int(token)] = child
+            node = child
+        node.terminal_sample_ids.append(sample_idx)
+
+    rank_to_sample: list[int] = []
+    stack: list[_ScheduleTrieNode] = [root]
+    while stack:
+        node = stack.pop()
+        if node.terminal_sample_ids:
+            rank_to_sample.extend(node.terminal_sample_ids)
+        if node.children:
+            for token in sorted(node.children.keys(), reverse=True):
+                stack.append(node.children[token])
+
+    sample_ranks = {sample_idx: rank for rank, sample_idx in enumerate(rank_to_sample)}
+
+    adjacent_lcps: list[int] = []
+    for prev_sample_idx, sample_idx in zip(rank_to_sample, rank_to_sample[1:], strict=True):
+        adjacent_lcps.append(
+            _longest_common_prefix(
+                sequences_by_sample[prev_sample_idx],
+                sequences_by_sample[sample_idx],
+            )
+        )
+
+    lcp_log2 = [0] * (len(adjacent_lcps) + 1)
+    for width in range(2, len(lcp_log2)):
+        lcp_log2[width] = lcp_log2[width // 2] + 1
+
+    lcp_sparse_table: list[list[int]] = [adjacent_lcps]
+    level = 1
+    while (1 << level) <= len(adjacent_lcps):
+        prev = lcp_sparse_table[level - 1]
+        half_width = 1 << (level - 1)
+        row = [
+            min(prev[offset], prev[offset + half_width])
+            for offset in range(len(adjacent_lcps) - (1 << level) + 1)
+        ]
+        lcp_sparse_table.append(row)
+        level += 1
+
+    return PrefixTreeScheduleContext(
+        sample_lengths=sample_lengths,
+        sample_ranks=sample_ranks,
+        rank_to_sample=rank_to_sample,
+        adjacent_lcps=adjacent_lcps,
+        lcp_sparse_table=lcp_sparse_table,
+        lcp_log2=lcp_log2,
+    )
 
 
 def summarize_prefix_tree_batch_plan(plan: PrefixTreeBatchPlan) -> dict[str, int | float]:

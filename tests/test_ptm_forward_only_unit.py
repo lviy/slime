@@ -20,6 +20,7 @@ from slime.utils.prefix_tree_merging_utils import (
     build_prefix_group_metadata,
     build_prefix_tree_batch_plan,
     build_prefix_tree_context_from_rollout_data,
+    build_prefix_tree_schedule_context,
     estimate_prefix_tree_merged_token_count,
     get_prefix_tree_runtime_skip_reason,
     summarize_prefix_tree_batch_plan,
@@ -422,6 +423,70 @@ def test_prefix_tree_batch_plan_summary_reports_range_density() -> None:
     assert summary["total_k_range_tokens"] >= plan.num_merged_tokens
     assert summary["avg_ranges_per_query"] >= 1.0
     assert summary["max_ranges_per_query"] >= 1
+
+
+@pytest.mark.unit
+def test_prefix_tree_schedule_context_lcp_matches_exact_prefix_lengths() -> None:
+    token_lists = [
+        [101, 11, 12, 13],
+        [101, 11, 12, 99],
+        [101, 11, 55],
+        [7, 8],
+    ]
+    sample_ids = [10, 20, 30, 40]
+
+    schedule_ctx = build_prefix_tree_schedule_context(token_lists, sample_ids=sample_ids)
+
+    expected_lcps = {
+        (10, 20): 3,
+        (10, 30): 2,
+        (20, 30): 2,
+        (10, 40): 0,
+        (20, 40): 0,
+        (30, 40): 0,
+    }
+    for (sample_a, sample_b), expected in expected_lcps.items():
+        assert schedule_ctx.get_lcp(sample_a, sample_b) == expected
+        assert schedule_ctx.get_lcp(sample_b, sample_a) == expected
+
+
+@pytest.mark.unit
+def test_prefix_tree_schedule_context_exact_incremental_bucket_cost() -> None:
+    token_lists = [
+        [101, 11, 12, 13],
+        [101, 11, 12, 99],
+        [101, 11, 55],
+        [7, 8],
+    ]
+    sample_ids = [0, 1, 2, 3]
+    schedule_ctx = build_prefix_tree_schedule_context(token_lists, sample_ids=sample_ids)
+
+    bucket_sample_ids = [0, 2]
+    sample_to_insert = 1
+
+    existing_ranks = sorted(schedule_ctx.get_rank(sample_idx) for sample_idx in bucket_sample_ids)
+    existing_merged = estimate_prefix_tree_merged_token_count([token_lists[idx] for idx in bucket_sample_ids])
+
+    insert_rank = schedule_ctx.get_rank(sample_to_insert)
+    insert_pos = 0
+    while insert_pos < len(existing_ranks) and existing_ranks[insert_pos] < insert_rank:
+        insert_pos += 1
+
+    prev_rank = existing_ranks[insert_pos - 1] if insert_pos > 0 else None
+    next_rank = existing_ranks[insert_pos] if insert_pos < len(existing_ranks) else None
+
+    incremental_merged = existing_merged + schedule_ctx.get_length(sample_to_insert)
+    if prev_rank is not None:
+        incremental_merged -= schedule_ctx.get_lcp_by_rank(prev_rank, insert_rank)
+    if next_rank is not None:
+        incremental_merged -= schedule_ctx.get_lcp_by_rank(insert_rank, next_rank)
+    if prev_rank is not None and next_rank is not None:
+        incremental_merged += schedule_ctx.get_lcp_by_rank(prev_rank, next_rank)
+
+    expected_merged = estimate_prefix_tree_merged_token_count(
+        [token_lists[idx] for idx in [*bucket_sample_ids, sample_to_insert]]
+    )
+    assert incremental_merged == expected_merged
 
 
 @pytest.mark.unit
