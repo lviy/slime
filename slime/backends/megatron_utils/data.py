@@ -838,7 +838,9 @@ def log_rollout_data(
     - Tensor-valued lists are concatenated and averaged. For token-level metrics
       like log-probs/returns/advantages/values, computes a CP-correct sample mean
       using `loss_masks` and total/response lengths.
-    - Non-tensor lists are averaged elementwise.
+    - Numeric non-tensor lists are averaged elementwise.
+    - Opaque helper/raw-data lists (for example cached CPU tokens or scheduler
+      contexts) are skipped instead of being treated as metrics.
     - Scalars are converted to Python numbers.
     """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
@@ -858,12 +860,16 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "tokens_cpu",
+                "ptm_schedule_contexts",
             ]:
                 continue
             # Upload per sample mean for each rollout value
             # There are the following assumptions:
             # - Each dp rank has the same number of samples
             if isinstance(val, (list, tuple)):
+                if len(val) == 0:
+                    continue
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
@@ -890,7 +896,15 @@ def log_rollout_data(
                         val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
                 else:
-                    val = sum(val) / len(val)
+                    if all(isinstance(item, (int, float, bool, np.integer, np.floating)) for item in val):
+                        val = sum(float(item) for item in val) / len(val)
+                    else:
+                        logger.debug(
+                            "Skip non-numeric rollout field %s from logging (element type: %s)",
+                            key,
+                            type(val[0]).__name__,
+                        )
+                        continue
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             elif isinstance(val, (int, float, np.integer, np.floating)):
