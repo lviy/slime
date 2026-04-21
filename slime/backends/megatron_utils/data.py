@@ -58,6 +58,8 @@ def get_batch(
 
     Returns a dict including:
     - "tokens": torch.LongTensor of shape [1, T_padded] on the current CUDA device
+    - "position_ids": optional torch.LongTensor of shape [1, T_padded] when runtime PTM keeps
+      original per-token positions for RoPE / absolute position embeddings
     - "unconcat_tokens": list[torch.LongTensor] for the micro-batch before CP slicing/concat
     - "packed_seq_params": PackedSeqParams with T-H-D settings (cu_seqlens on CUDA, dtype=int)
     Plus any other requested keys forwarded from the iterator.
@@ -78,6 +80,7 @@ def get_batch(
 
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
+    batch["position_ids"] = None
 
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
@@ -133,11 +136,15 @@ def get_batch(
                     device = tokens[0].device
                     dtype = tokens[0].dtype
                     merged_tokens = torch.tensor(ptm_plan.merged_tokens, dtype=dtype, device=device)
+                    merged_position_ids = torch.tensor(
+                        ptm_plan.merged_position_ids, dtype=torch.long, device=device
+                    )
                     # PTM still runs in THD/CP=1 mode, but TP/sequence parallel may require
                     # the token stream length to be padded to a TP-aligned multiple.
                     ptm_pad = (pad_size - merged_tokens.size(0) % pad_size) % pad_size if tp_size > 1 else 0
                     if ptm_pad != 0:
                         merged_tokens = F.pad(merged_tokens, (0, ptm_pad), value=pad_token_id)
+                        merged_position_ids = F.pad(merged_position_ids, (0, ptm_pad), value=0)
                     cu_seqlens = torch.tensor(
                         [0, merged_tokens.size(0)], dtype=torch.int, device=torch.cuda.current_device()
                     )
@@ -148,22 +155,35 @@ def get_batch(
                         max_seqlen_q=max_seqlen,
                         max_seqlen_kv=max_seqlen,
                         qkv_format="thd",
-                        ptm_q_ranges=torch.tensor(
-                            ptm_plan.q_ranges, dtype=torch.int32, device=torch.cuda.current_device()
-                        ),
-                        ptm_k_ranges=torch.tensor(
-                            ptm_plan.k_ranges, dtype=torch.int32, device=torch.cuda.current_device()
-                        ),
-                        ptm_attn_type_map=torch.tensor(
-                            ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
-                        ),
-                        ptm_q_ranges_non_overlapped=bool(ptm_runtime_stats.get("q_ranges_non_overlapped", 0)),
                     )
+                    # Keep the constructor ABI compatible with older Megatron runtimes used
+                    # in cloud jobs, then attach PTM metadata dynamically.
+                    packed_seq_params.ptm_q_ranges = torch.tensor(
+                        ptm_plan.q_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                    packed_seq_params.ptm_k_ranges = torch.tensor(
+                        ptm_plan.k_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                    packed_seq_params.ptm_attn_type_map = torch.tensor(
+                        ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                    packed_seq_params.ptm_q_ranges_non_overlapped = bool(
+                        ptm_runtime_stats.get("q_ranges_non_overlapped", 0)
+                    )
+                    packed_seq_params.explicit_position_ids = True
                     tokens = merged_tokens.unsqueeze(0)
+                    batch["position_ids"] = merged_position_ids.unsqueeze(0)
                     batch["ptm_unmerge_index"] = torch.tensor(
                         ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
                     )
-                    ptm_runtime_stats.update({"applied": True, "skip_reason": "applied"})
+                    ptm_runtime_stats.update(
+                        {
+                            "applied": True,
+                            "skip_reason": "applied",
+                            "max_position_id": max(ptm_plan.merged_position_ids, default=-1),
+                            "num_unique_position_ids": len(set(ptm_plan.merged_position_ids)),
+                        }
+                    )
                     ptm_applied = True
         if ptm_profile_start is not None:
             if torch.cuda.is_available():

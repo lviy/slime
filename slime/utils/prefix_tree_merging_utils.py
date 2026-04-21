@@ -58,6 +58,7 @@ class _RuntimeTrieNode:
 @dataclass
 class PrefixTreeBatchPlan:
     merged_tokens: list[int]
+    merged_position_ids: list[int]
     q_ranges: list[list[int]]
     k_ranges: list[list[int]]
     attn_type_map: list[int]
@@ -179,6 +180,7 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
     if len(sequences) == 0:
         return PrefixTreeBatchPlan(
             merged_tokens=[],
+            merged_position_ids=[],
             q_ranges=[],
             k_ranges=[],
             attn_type_map=[],
@@ -203,6 +205,7 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
         sample_paths.append(path)
 
     merged_tokens: list[int] = []
+    merged_position_ids: list[int] = []
     q_ranges: list[list[int]] = []
     k_ranges: list[list[int]] = []
     attn_type_map: list[int] = []
@@ -224,6 +227,7 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
         for node in chain_nodes:
             node.index = len(merged_tokens)
             merged_tokens.append(int(node.token))
+            merged_position_ids.append(max(int(node.depth) - 1, 0))
         chain_end = len(merged_tokens)
 
         chain_interval = (chain_start, chain_end)
@@ -251,6 +255,7 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
     num_input_tokens = sum(len(seq) for seq in sequences)
     return PrefixTreeBatchPlan(
         merged_tokens=merged_tokens,
+        merged_position_ids=merged_position_ids,
         q_ranges=q_ranges,
         k_ranges=k_ranges,
         attn_type_map=attn_type_map,

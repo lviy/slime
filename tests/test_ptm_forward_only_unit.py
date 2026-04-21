@@ -91,21 +91,25 @@ def _build_legacy_token_level_plan(tokens: list[list[int]]) -> PrefixTreeBatchPl
         sample_paths.append(path)
 
     merged_tokens: list[int] = []
+    merged_position_ids: list[int] = []
     parent_indices: list[int] = []
     stack: list[dict] = []
     for child in reversed(list(trie_children.values())):
         child["parent"] = None
+        child["depth"] = 1
         stack.append(child)
 
     while stack:
         node = stack.pop()
         node["index"] = len(merged_tokens)
         merged_tokens.append(int(node["token"]))
+        merged_position_ids.append(int(node["depth"]) - 1)
         parent = node["parent"]
         parent_indices.append(-1 if parent is None else int(parent["index"]))
         child_values = list(node["children"].values())
         for child in reversed(child_values):
             child["parent"] = node
+            child["depth"] = int(node["depth"]) + 1
             stack.append(child)
 
     unmerge_index: list[int] = []
@@ -139,6 +143,7 @@ def _build_legacy_token_level_plan(tokens: list[list[int]]) -> PrefixTreeBatchPl
 
     return PrefixTreeBatchPlan(
         merged_tokens=merged_tokens,
+        merged_position_ids=merged_position_ids,
         q_ranges=q_ranges,
         k_ranges=k_ranges,
         attn_type_map=attn_type_map,
@@ -393,6 +398,7 @@ def test_prefix_tree_batch_plan_merges_shared_prefixes() -> None:
     assert estimate_prefix_tree_merged_token_count(token_lists) == 7
     assert len(plan.unmerge_index) == plan.num_input_tokens
     assert len(plan.merged_tokens) == plan.num_merged_tokens
+    assert len(plan.merged_position_ids) == plan.num_merged_tokens
 
 
 @pytest.mark.unit

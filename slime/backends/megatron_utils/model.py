@@ -256,7 +256,7 @@ def forward_only(
         response_lengths = batch["response_lengths"]
         forward_kwargs = {
             "input_ids": tokens,
-            "position_ids": None,
+            "position_ids": batch.get("position_ids"),
             "attention_mask": None,
             "labels": None,
             "packed_seq_params": packed_seq_params,
@@ -318,6 +318,8 @@ def forward_only(
                 "num_unique_q_ranges",
                 "num_duplicated_q_ranges",
                 "q_ranges_non_overlapped",
+                "max_position_id",
+                "num_unique_position_ids",
                 "avg_ranges_per_query",
                 "max_ranges_per_query",
                 "queries_with_multiple_ranges",
@@ -498,7 +500,7 @@ def train_one_step(
 
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
-            position_ids = None
+            position_ids = batch.get("position_ids")
             output_tensor = model.build_schedule_plan(
                 input_ids=batch["tokens"],
                 position_ids=position_ids,
@@ -510,7 +512,7 @@ def train_one_step(
         else:
             forward_kwargs = {
                 "input_ids": batch["tokens"],
-                "position_ids": None,
+                "position_ids": batch.get("position_ids"),
                 "attention_mask": None,
                 "labels": None,
                 "packed_seq_params": batch["packed_seq_params"],
@@ -564,6 +566,8 @@ def train_one_step(
                 "num_unique_q_ranges",
                 "num_duplicated_q_ranges",
                 "q_ranges_non_overlapped",
+                "max_position_id",
+                "num_unique_position_ids",
                 "avg_ranges_per_query",
                 "max_ranges_per_query",
                 "queries_with_multiple_ranges",
