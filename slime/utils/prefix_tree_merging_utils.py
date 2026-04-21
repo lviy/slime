@@ -192,7 +192,7 @@ def build_prefix_tree_schedule_context(
     sample_ranks = {sample_idx: rank for rank, sample_idx in enumerate(rank_to_sample)}
 
     adjacent_lcps: list[int] = []
-    for prev_sample_idx, sample_idx in zip(rank_to_sample, rank_to_sample[1:], strict=True):
+    for prev_sample_idx, sample_idx in zip(rank_to_sample, rank_to_sample[1:]):
         adjacent_lcps.append(
             _longest_common_prefix(
                 sequences_by_sample[prev_sample_idx],

@@ -451,6 +451,19 @@ def test_prefix_tree_schedule_context_lcp_matches_exact_prefix_lengths() -> None
 
 
 @pytest.mark.unit
+def test_prefix_tree_schedule_context_single_sample() -> None:
+    schedule_ctx = build_prefix_tree_schedule_context([[101, 11, 12]], sample_ids=[7])
+
+    assert schedule_ctx.num_samples == 1
+    assert schedule_ctx.rank_to_sample == [7]
+    assert schedule_ctx.get_rank(7) == 0
+    assert schedule_ctx.get_length(7) == 3
+    assert schedule_ctx.get_lcp(7, 7) == 3
+    assert schedule_ctx.adjacent_lcps == []
+    assert schedule_ctx.lcp_sparse_table == [[]]
+
+
+@pytest.mark.unit
 def test_prefix_tree_schedule_context_exact_incremental_bucket_cost() -> None:
     token_lists = [
         [101, 11, 12, 13],
