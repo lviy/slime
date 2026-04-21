@@ -433,6 +433,7 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
+    ptm_debug_enabled = is_ptm_debug_enabled()
 
     # Set grad to zero.
     for model_chunk in model:

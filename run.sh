@@ -34,6 +34,7 @@ bash scripts/run_ptm_forward_speed.sh \
     --save-dir /tmp/moonlight16b_speed
 
 # qwen 8b
+SLIME_PTM_DEBUG=1 \
 SLIME_PTM_E2E_MEGATRON_PATH=/gfs/platform/public/infra/lxr/Megatron-LM \
 SLIME_PTM_E2E_PYTHONPATH=/gfs/platform/public/infra/lxr/sglang/python:/gfs/platform/public/infra/lxr/Megatron-LM \
 SLIME_PTM_E2E_LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
@@ -46,9 +47,8 @@ SLIME_PTM_E2E_LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
     --tensor-model-parallel-size 2 \
     --pipeline-model-parallel-size 2 \
     --context-parallel-size 1 \
-    --warmup-runs 1 \
-    --measure-runs 2 \
-    --max-tokens-per-gpu 10240 \
+    --max-tokens-per-gpu 8192 \
+    --num-rollout 1 \
     --ptm-mode both \
     --save-dir /tmp/qwen3_8b_speed \
     --skip-prepare > /gfs/platform/public/infra/lxr/logs/qwen3_8b_ptm_forward_speed.log 2>&1
