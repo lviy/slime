@@ -468,9 +468,12 @@ def get_data_iterator(
         )
 
     ptm_debug_enabled = is_ptm_debug_enabled()
+    track_iterator_timing = timer_prefix is not None and (
+        timer_prefix != "actor_logprob_data_iterator" or ptm_debug_enabled
+    )
 
     def _add_timing(metric_name: str, elapsed_s: float) -> None:
-        if timer_prefix is not None:
+        if track_iterator_timing:
             Timer().add(metric_name, elapsed_s)
 
     def _should_log_schedule_details() -> bool:

@@ -23,9 +23,12 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.prefix_tree_merging_utils import (
+    add_ptm_debug_timing,
     build_prefix_group_metadata,
     build_prefix_tree_schedule_context,
+    format_ptm_debug_timing_metrics,
     is_ptm_debug_enabled,
+    start_ptm_debug_timer,
 )
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -483,6 +486,9 @@ class RolloutManager:
 
     def generate(self, rollout_id):
         start_time = time.time()
+        generate_debug_start = start_ptm_debug_timer()
+        generate_debug_timings: dict[str, float] | None = {} if is_ptm_debug_enabled() else None
+        generate_debug_extra_metrics: dict[str, int | float] | None = {} if is_ptm_debug_enabled() else None
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
@@ -493,8 +499,24 @@ class RolloutManager:
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
             return
-        data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        convert_start = start_ptm_debug_timer()
+        data = self._convert_samples_to_train_data(data, debug_timings=generate_debug_timings)
+        add_ptm_debug_timing(generate_debug_timings, "rollout_convert_samples_to_train_data", convert_start)
+        split_start = start_ptm_debug_timer()
+        rollout_data_refs = self._split_train_data_by_dp(
+            data,
+            self.train_parallel_config["dp_size"],
+            debug_timings=generate_debug_timings,
+            debug_extra_metrics=generate_debug_extra_metrics,
+        )
+        add_ptm_debug_timing(generate_debug_timings, "rollout_split_train_data_by_dp", split_start)
+        add_ptm_debug_timing(generate_debug_timings, "rollout_generate_total", generate_debug_start)
+        if generate_debug_timings is not None:
+            logger.info(
+                f"[PTMDebug] rollout perf {rollout_id}: "
+                f"{format_ptm_debug_timing_metrics(generate_debug_timings, extra_metrics=generate_debug_extra_metrics)}"
+            )
+        return rollout_data_refs
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -685,7 +707,11 @@ class RolloutManager:
 
         return raw_rewards, raw_rewards
 
-    def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
+    def _convert_samples_to_train_data(
+        self,
+        samples: list[Sample] | list[list[Sample]],
+        debug_timings: dict[str, float] | None = None,
+    ):
         """
         Convert inference generated samples to training data.
         """
@@ -753,11 +779,13 @@ class RolloutManager:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
         if self.args.slime_prefix_tree_merging:
+            ptm_metadata_start = start_ptm_debug_timer()
             ptm_metadata = build_prefix_group_metadata(
                 tokens=train_data["tokens"],
                 prefix_max_len=self.args.slime_prefix_max_len,
                 min_group_size=self.args.slime_prefix_min_group_size,
             )
+            add_ptm_debug_timing(debug_timings, "rollout_ptm_metadata_build", ptm_metadata_start)
             train_data.update(ptm_metadata)
             if is_ptm_debug_enabled():
                 logger.info(
@@ -775,7 +803,13 @@ class RolloutManager:
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
-    def _split_train_data_by_dp(self, data, dp_size):
+    def _split_train_data_by_dp(
+        self,
+        data,
+        dp_size,
+        debug_timings: dict[str, float] | None = None,
+        debug_extra_metrics: dict[str, int | float] | None = None,
+    ):
         """Split the train data by data parallel size."""
         rollout_data = {}
 
@@ -793,6 +827,7 @@ class RolloutManager:
         rollout_data_refs = []
         global_batch_size = getattr(self, "_dynamic_global_batch_size", self.args.global_batch_size)
         num_local_gbs = global_batch_size // dp_size
+        schedule_context_build_calls = 0
 
         for i in range(dp_size):
             rollout_data = {}
@@ -851,14 +886,19 @@ class RolloutManager:
                     local_end = (step_idx + 1) * num_local_gbs
                     step_tokens = rollout_data["tokens_cpu"][local_start:local_end]
                     step_sample_ids = list(range(local_start, local_end))
+                    schedule_context_start = start_ptm_debug_timer()
                     step_schedule_contexts.append(
                         build_prefix_tree_schedule_context(step_tokens, sample_ids=step_sample_ids)
                     )
+                    add_ptm_debug_timing(debug_timings, "rollout_ptm_schedule_context_build", schedule_context_start)
+                    schedule_context_build_calls += 1
                 rollout_data["ptm_schedule_contexts"] = step_schedule_contexts
             # Pass dynamic global_batch_size to training side
             if hasattr(self, "_dynamic_global_batch_size"):
                 rollout_data["dynamic_global_batch_size"] = self._dynamic_global_batch_size
             rollout_data_refs.append(Box(ray.put(rollout_data)))
+        if debug_extra_metrics is not None and schedule_context_build_calls > 0:
+            debug_extra_metrics["perf/rollout_ptm_schedule_context_build_calls"] = schedule_context_build_calls
         return rollout_data_refs
 
 

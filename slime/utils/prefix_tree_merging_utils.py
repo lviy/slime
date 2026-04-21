@@ -3,6 +3,7 @@ import os
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -13,6 +14,38 @@ _PTM_DEBUG_ENV = "SLIME_PTM_DEBUG"
 
 def is_ptm_debug_enabled() -> bool:
     return os.environ.get(_PTM_DEBUG_ENV, "0").strip().lower() in {"1", "true", "yes"}
+
+
+def start_ptm_debug_timer() -> float | None:
+    """Start a PTM debug-only timer and return its start timestamp."""
+
+    if not is_ptm_debug_enabled():
+        return None
+    return perf_counter()
+
+
+def add_ptm_debug_timing(
+    timings: dict[str, float] | None,
+    metric_name: str,
+    start_time: float | None,
+) -> None:
+    """Accumulate a PTM debug-only elapsed time into ``timings``."""
+
+    if timings is None or start_time is None:
+        return
+    timings[metric_name] = timings.get(metric_name, 0.0) + (perf_counter() - start_time)
+
+
+def format_ptm_debug_timing_metrics(
+    timings: dict[str, float],
+    extra_metrics: dict[str, int | float] | None = None,
+) -> dict[str, int | float]:
+    """Format PTM debug timings into log-friendly metric names."""
+
+    metrics: dict[str, int | float] = {f"perf/{metric_name}_time": elapsed for metric_name, elapsed in timings.items()}
+    if extra_metrics:
+        metrics.update(extra_metrics)
+    return metrics
 
 
 @dataclass
