@@ -387,6 +387,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.model,
             rollout_data,
             enable_ptm_aware_dynamic_batching=False,
+            timer_prefix="critic_data_iterator",
         )
         rollout_data.update(
             forward_only(
@@ -403,6 +404,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         compute_advantages_and_returns(self.args, rollout_data)
 
+        prefix_tree_context = None
         self.args.loss_type = "value_loss"
         train(
             rollout_id,
@@ -412,7 +414,7 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator,
             num_microbatches,
             prefix_tree_context=prefix_tree_context,
-            prefix_tree_stage="actor-train",
+            prefix_tree_stage="critic-train",
         )
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
@@ -422,6 +424,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.model,
             rollout_data,
             enable_ptm_aware_dynamic_batching=False,
+            timer_prefix="actor_train_data_iterator",
         )
         # By default, logprob uses the same schedule as training.
         logprob_data_iterator, logprob_num_microbatches = data_iterator, num_microbatches
@@ -431,6 +434,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.model,
                 rollout_data,
                 force_single_sample_microbatch=True,
+                timer_prefix="actor_logprob_data_iterator",
             )
             if is_megatron_main_rank():
                 logger.info(
@@ -446,6 +450,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.model,
                 rollout_data,
                 enable_ptm_aware_dynamic_batching=True,
+                timer_prefix="actor_logprob_data_iterator",
             )
             if is_megatron_main_rank():
                 logger.info(

@@ -157,6 +157,7 @@ def get_batch(
                         ptm_attn_type_map=torch.tensor(
                             ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
                         ),
+                        ptm_q_ranges_non_overlapped=bool(ptm_runtime_stats.get("q_ranges_non_overlapped", 0)),
                     )
                     tokens = merged_tokens.unsqueeze(0)
                     batch["ptm_unmerge_index"] = torch.tensor(
@@ -401,6 +402,7 @@ def get_data_iterator(
     rollout_data: RolloutBatch,
     force_single_sample_microbatch: bool = False,
     enable_ptm_aware_dynamic_batching: bool | None = None,
+    timer_prefix: str | None = None,
 ) -> tuple[list[DataIterator], list[int]]:
     """
     Create iterators and a micro-batch schedule for a rollout step.
@@ -421,6 +423,7 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    iterator_start_time = perf_counter()
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     dp_group = mpu.get_data_parallel_group()
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -444,6 +447,13 @@ def get_data_iterator(
             f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
         )
 
+    def _add_timing(metric_name: str, elapsed_s: float) -> None:
+        if timer_prefix is not None:
+            Timer().add(metric_name, elapsed_s)
+
+    def _should_log_schedule_details() -> bool:
+        return not dist.is_initialized() or dist.get_rank() == 0
+
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
         data_iterator = []
         for _ in range(vpp_size):
@@ -451,8 +461,9 @@ def get_data_iterator(
         return data_iterator
 
     def _estimate_ptm_sched_tokens(sample_indices: list[int]) -> int:
+        token_source = rollout_data.get("tokens_cpu", rollout_data["tokens"])
         token_slices = [
-            rollout_data["tokens"][sample_idx][: rollout_data["total_lengths"][sample_idx]]
+            token_source[sample_idx][: rollout_data["total_lengths"][sample_idx]]
             for sample_idx in sample_indices
         ]
         merged_tokens = estimate_prefix_tree_merged_token_count(token_slices)
@@ -461,11 +472,22 @@ def get_data_iterator(
         pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
         return merged_tokens + ((pad_size - merged_tokens % pad_size) % pad_size)
 
+    ptm_sched_metrics: dict[str, int | float] = {
+        "build_calls": 0,
+        "candidate_evals": 0,
+        "estimate_calls": 0,
+        "estimate_cache_hits": 0,
+        "estimate_cache_misses": 0,
+        "estimate_time_s": 0.0,
+        "reused_first_pass_steps": 0,
+    }
+
     def _build_ptm_aware_microbatches(
         step_indices: list[int],
         token_budget: int,
         target_num_mbs: int,
         require_exact_count: bool = False,
+        cost_cache: dict[tuple[int, ...], int] | None = None,
     ) -> list[list[int]]:
         if not step_indices:
             return []
@@ -478,7 +500,8 @@ def get_data_iterator(
         total_lengths = rollout_data["total_lengths"]
         group_sizes = rollout_data.get("ptm_group_sizes")
         prefix_lens = rollout_data.get("ptm_prefix_lens")
-        cost_cache: dict[tuple[int, ...], int] = {}
+        cost_cache = {} if cost_cache is None else cost_cache
+        ptm_sched_metrics["build_calls"] += 1
 
         def _prefix_len(sample_idx: int) -> int:
             if prefix_lens is None:
@@ -495,10 +518,15 @@ def get_data_iterator(
 
         def _estimate_cached(sample_indices: list[int]) -> int:
             key = tuple(sorted(sample_indices))
+            ptm_sched_metrics["estimate_calls"] += 1
             cached = cost_cache.get(key)
             if cached is not None:
+                ptm_sched_metrics["estimate_cache_hits"] += 1
                 return cached
+            ptm_sched_metrics["estimate_cache_misses"] += 1
+            estimate_start_time = perf_counter()
             cost = int(_estimate_ptm_sched_tokens(list(key)))
+            ptm_sched_metrics["estimate_time_s"] += perf_counter() - estimate_start_time
             cost_cache[key] = cost
             return cost
 
@@ -534,6 +562,7 @@ def get_data_iterator(
             overflow_candidates: list[tuple[int, int, int, int, int]] = []
 
             for slot_idx, existing in enumerate(microbatches):
+                ptm_sched_metrics["candidate_evals"] += 1
                 candidate = existing + [sample_idx]
                 candidate_cost = _estimate_cached(candidate)
                 marginal_cost = candidate_cost - microbatch_costs[slot_idx]
@@ -618,20 +647,31 @@ def get_data_iterator(
         assert len(samples) == num_local_samples
         token_budget = args.max_tokens_per_gpu * cp_size
         num_microbatches = []
+        ptm_sched_first_pass_elapsed = 0.0
+        ptm_sched_second_pass_elapsed = 0.0
+        first_pass_partitions: list[list[list[int]] | None] = [None] * num_steps_per_rollout
+        step_cost_caches: list[dict[tuple[int, ...], int] | None] = [None] * num_steps_per_rollout
+        first_pass_start_time = perf_counter()
         for i in range(num_steps_per_rollout):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             if use_ptm_sched:
                 step_indices = list(range(start, end))
+                step_cost_cache: dict[tuple[int, ...], int] = {}
                 step_partitions = _build_ptm_aware_microbatches(
                     step_indices,
                     token_budget,
                     target_num_mbs=len(step_indices),
                     require_exact_count=False,
+                    cost_cache=step_cost_cache,
                 )
+                first_pass_partitions[i] = step_partitions
+                step_cost_caches[i] = step_cost_cache
                 num_microbatches.append(len(step_partitions))
             else:
                 num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], token_budget))
+        ptm_sched_first_pass_elapsed = perf_counter() - first_pass_start_time
 
+        sync_start_time = perf_counter()
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
         dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
 
@@ -643,18 +683,26 @@ def get_data_iterator(
             )
 
         num_microbatches = num_microbatches.tolist()
+        sync_elapsed = perf_counter() - sync_start_time
 
         micro_batch_indices = []
+        second_pass_start_time = perf_counter()
         if use_ptm_sched:
             for i, target_num_mbs in enumerate(num_microbatches):
                 start, end = i * num_local_gbs, (i + 1) * num_local_gbs
                 step_indices = list(range(start, end))
-                partitions = _build_ptm_aware_microbatches(
-                    step_indices,
-                    token_budget,
-                    target_num_mbs=target_num_mbs,
-                    require_exact_count=True,
-                )
+                local_first_pass_partitions = first_pass_partitions[i]
+                if local_first_pass_partitions is not None and len(local_first_pass_partitions) == target_num_mbs:
+                    partitions = [partition.copy() for partition in local_first_pass_partitions]
+                    ptm_sched_metrics["reused_first_pass_steps"] += 1
+                else:
+                    partitions = _build_ptm_aware_microbatches(
+                        step_indices,
+                        token_budget,
+                        target_num_mbs=target_num_mbs,
+                        require_exact_count=True,
+                        cost_cache=step_cost_caches[i],
+                    )
                 micro_batch_indices.extend(partitions)
         else:
             samples = rollout_data["total_lengths"]
@@ -666,11 +714,47 @@ def get_data_iterator(
                     for k in range(len(partitions[j])):
                         partitions[j][k] += start
                 micro_batch_indices.extend(partitions)
+        ptm_sched_second_pass_elapsed = perf_counter() - second_pass_start_time
 
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
+        if use_ptm_sched:
+            total_ptm_sched_time = ptm_sched_first_pass_elapsed + ptm_sched_second_pass_elapsed
+            _add_timing(f"{timer_prefix}_ptm_sched", total_ptm_sched_time)
+            _add_timing(f"{timer_prefix}_ptm_sched_first_pass", ptm_sched_first_pass_elapsed)
+            _add_timing(f"{timer_prefix}_ptm_sched_second_pass", ptm_sched_second_pass_elapsed)
+            _add_timing(f"{timer_prefix}_ptm_sched_estimate", float(ptm_sched_metrics["estimate_time_s"]))
+
+            if _should_log_schedule_details():
+                logger.info(
+                    "[PTMScheduler] stage=%s steps=%d token_budget=%d "
+                    "first_pass_time_s=%.3f second_pass_time_s=%.3f sync_time_s=%.3f "
+                    "estimate_time_s=%.3f estimate_calls=%d estimate_cache_hits=%d "
+                    "estimate_cache_misses=%d candidate_evals=%d build_calls=%d "
+                    "reused_first_pass_steps=%d/%d local_num_microbatches=%s final_num_microbatches=%s",
+                    timer_prefix or "data_iterator",
+                    num_steps_per_rollout,
+                    token_budget,
+                    ptm_sched_first_pass_elapsed,
+                    ptm_sched_second_pass_elapsed,
+                    sync_elapsed,
+                    float(ptm_sched_metrics["estimate_time_s"]),
+                    int(ptm_sched_metrics["estimate_calls"]),
+                    int(ptm_sched_metrics["estimate_cache_hits"]),
+                    int(ptm_sched_metrics["estimate_cache_misses"]),
+                    int(ptm_sched_metrics["candidate_evals"]),
+                    int(ptm_sched_metrics["build_calls"]),
+                    int(ptm_sched_metrics["reused_first_pass_steps"]),
+                    num_steps_per_rollout,
+                    [len(p) if p is not None else 0 for p in first_pass_partitions],
+                    num_microbatches,
+                )
+        _add_timing(f"{timer_prefix}_microbatch_sync", sync_elapsed)
+
+    total_iterator_elapsed = perf_counter() - iterator_start_time
+    _add_timing(timer_prefix or "", total_iterator_elapsed)
     return (
         data_iterator,
         num_microbatches,
