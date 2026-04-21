@@ -215,6 +215,15 @@ def build_parser() -> ArgumentParser:
         help="Optional subsample ratio for loaded rollout debug data.",
     )
     parser.add_argument(
+        "--train-memory-margin-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for --train-memory-margin-bytes passed to the train job. "
+            "Useful for sweeping TorchMemorySaver offload margin without editing the benchmark harness."
+        ),
+    )
+    parser.add_argument(
         "--save-debug-train-data",
         action="store_true",
         help="If set, also dump debug train `.pt` files for each measured run. Disabled by default to avoid I/O noise.",
@@ -428,6 +437,7 @@ def _common_args(
     expert_tensor_parallel_size: int,
     max_tokens_per_gpu: int,
     decoder_last_pipeline_num_layers: int | None,
+    train_memory_margin_bytes: int | None,
 ) -> str:
     ckpt_args = f"--hf-checkpoint {model_path} " f"--ref-load {ref_load} "
 
@@ -482,6 +492,8 @@ def _common_args(
         f"--megatron-to-hf-mode {megatron_to_hf_mode} "
         "--seed 42 "
     )
+    if train_memory_margin_bytes is not None:
+        misc_args += f"--train-memory-margin-bytes {train_memory_margin_bytes} "
 
     return f"{ckpt_args} " f"{rollout_args} " f"{optimizer_args} " f"{grpo_args} " f"{perf_args} " f"{misc_args} "
 
@@ -585,6 +597,7 @@ def execute_phase3_only(
     expert_tensor_parallel_size: int,
     max_tokens_per_gpu: int,
     decoder_last_pipeline_num_layers: int | None,
+    train_memory_margin_bytes: int | None,
     ptm_enabled: bool,
     save_dir: str,
     save_tag: str,
@@ -599,7 +612,7 @@ def execute_phase3_only(
             "Please provide either a {rollout_id} template or an indexed path such as rollout_0.pt."
         )
     phase_args = (
-        f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode, tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size, expert_model_parallel_size, expert_tensor_parallel_size, max_tokens_per_gpu, decoder_last_pipeline_num_layers)} "
+        f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode, tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size, expert_model_parallel_size, expert_tensor_parallel_size, max_tokens_per_gpu, decoder_last_pipeline_num_layers, train_memory_margin_bytes)} "
         f"--load-debug-rollout-data {resolved_rollout_pt} "
     )
     if ci_test:
@@ -718,6 +731,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 max_tokens_per_gpu=args.max_tokens_per_gpu,
                 decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+                train_memory_margin_bytes=args.train_memory_margin_bytes,
                 ptm_enabled=ptm_enabled,
                 save_dir=save_dir,
                 save_tag=run_tag,
@@ -756,6 +770,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 max_tokens_per_gpu=args.max_tokens_per_gpu,
                 decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+                train_memory_margin_bytes=args.train_memory_margin_bytes,
                 ptm_enabled=ptm_enabled,
                 save_dir=save_dir,
                 save_tag=run_tag,
@@ -793,6 +808,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
             "expert_tensor_parallel_size": args.expert_tensor_parallel_size,
             "max_tokens_per_gpu": args.max_tokens_per_gpu,
             "decoder_last_pipeline_num_layers": args.decoder_last_pipeline_num_layers,
+            "train_memory_margin_bytes": args.train_memory_margin_bytes,
         },
         "model": {
             "preset": args.model,
