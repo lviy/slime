@@ -4,6 +4,7 @@ import random
 import socket
 from argparse import Namespace
 from contextlib import nullcontext
+from time import perf_counter
 
 import numpy as np
 import ray
@@ -170,23 +171,46 @@ class MegatronTrainRayActor(TrainRayActor):
     def sleep(self) -> None:
         assert self.args.offload_train
 
-        clear_memory(clear_host_memory=True)
-        print_memory("before offload model")
-        destroy_process_groups()
+        ptm_debug_enabled = is_ptm_debug_enabled()
 
+        clear_memory_start = perf_counter() if ptm_debug_enabled else None
+        clear_memory(clear_host_memory=True)
+        if clear_memory_start is not None:
+            Timer().add("sleep_clear_memory", perf_counter() - clear_memory_start)
+        print_memory("before offload model")
+
+        destroy_pg_start = perf_counter() if ptm_debug_enabled else None
+        destroy_process_groups()
+        if destroy_pg_start is not None:
+            Timer().add("sleep_destroy_process_groups", perf_counter() - destroy_pg_start)
+
+        pause_start = perf_counter() if ptm_debug_enabled else None
         torch_memory_saver.pause()
+        if pause_start is not None:
+            Timer().add("sleep_torch_memory_saver_pause", perf_counter() - pause_start)
 
         print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
         assert self.args.offload_train
+        ptm_debug_enabled = is_ptm_debug_enabled()
         print_memory("before wake_up model")
 
+        resume_start = perf_counter() if ptm_debug_enabled else None
         torch_memory_saver.resume()
+        if resume_start is not None:
+            Timer().add("wake_up_torch_memory_saver_resume", perf_counter() - resume_start)
 
+        clear_memory_start = perf_counter() if ptm_debug_enabled else None
         clear_memory()
+        if clear_memory_start is not None:
+            Timer().add("wake_up_clear_memory", perf_counter() - clear_memory_start)
+
+        reload_pg_start = perf_counter() if ptm_debug_enabled else None
         reload_process_groups()
+        if reload_pg_start is not None:
+            Timer().add("wake_up_reload_process_groups", perf_counter() - reload_pg_start)
         print_memory("after wake_up model")
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
