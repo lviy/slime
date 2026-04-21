@@ -339,6 +339,7 @@ def test_forward_only_with_ptm_context(monkeypatch: pytest.MonkeyPatch) -> None:
         assert max_seq_lens == [4, 4]
         return {"scores": [logits.mean()]}
 
+    monkeypatch.setenv("SLIME_PTM_DEBUG", "1")
     monkeypatch.setattr(model_mod, "get_batch", fake_get_batch)
     monkeypatch.setattr(model_mod, "get_forward_backward_func", fake_forward_backward_func)
     monkeypatch.setattr(model_mod, "log_prefix_tree_context", fake_log_prefix_tree_context)

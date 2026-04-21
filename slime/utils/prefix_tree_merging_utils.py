@@ -1,10 +1,18 @@
 import logging
+import os
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+_PTM_DEBUG_ENV = "SLIME_PTM_DEBUG"
+
+
+def is_ptm_debug_enabled() -> bool:
+    return os.environ.get(_PTM_DEBUG_ENV, "0").strip().lower() in {"1", "true", "yes"}
 
 
 @dataclass
@@ -601,6 +609,8 @@ def log_prefix_tree_context(
     context: PrefixTreeMergingContext,
     extra: dict[str, Any] | None = None,
 ) -> None:
+    if not is_ptm_debug_enabled():
+        return
     extra_info = ""
     if extra:
         extra_info = ", " + ", ".join(f"{k}={v}" for k, v in sorted(extra.items()))

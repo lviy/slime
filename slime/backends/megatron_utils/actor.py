@@ -20,7 +20,11 @@ from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
-from slime.utils.prefix_tree_merging_utils import build_prefix_tree_context_from_rollout_data, log_prefix_tree_context
+from slime.utils.prefix_tree_merging_utils import (
+    build_prefix_tree_context_from_rollout_data,
+    is_ptm_debug_enabled,
+    log_prefix_tree_context,
+)
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
@@ -467,7 +471,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 prefix_tree_context = build_prefix_tree_context_from_rollout_data(
                     rollout_data, min_group_size=self.args.slime_prefix_min_group_size
                 )
-                if prefix_tree_context is not None and is_megatron_main_rank():
+                if prefix_tree_context is not None and is_megatron_main_rank() and is_ptm_debug_enabled():
                     log_prefix_tree_context("train_actor_build", prefix_tree_context)
 
             if self.args.compute_advantages_and_returns:

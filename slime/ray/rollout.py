@@ -22,7 +22,11 @@ from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
-from slime.utils.prefix_tree_merging_utils import build_prefix_group_metadata, build_prefix_tree_schedule_context
+from slime.utils.prefix_tree_merging_utils import (
+    build_prefix_group_metadata,
+    build_prefix_tree_schedule_context,
+    is_ptm_debug_enabled,
+)
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
@@ -755,15 +759,16 @@ class RolloutManager:
                 min_group_size=self.args.slime_prefix_min_group_size,
             )
             train_data.update(ptm_metadata)
-            logger.info(
-                "[PTM] rollout metadata: num_groups=%s, num_mergeable_groups=%s, "
-                "num_mergeable_samples=%s, max_group_size=%s, avg_group_size=%.2f",
-                ptm_metadata["ptm_num_groups"],
-                ptm_metadata["ptm_num_mergeable_groups"],
-                ptm_metadata["ptm_num_mergeable_samples"],
-                ptm_metadata["ptm_max_group_size"],
-                ptm_metadata["ptm_avg_group_size"],
-            )
+            if is_ptm_debug_enabled():
+                logger.info(
+                    "[PTM] rollout metadata: num_groups=%s, num_mergeable_groups=%s, "
+                    "num_mergeable_samples=%s, max_group_size=%s, avg_group_size=%.2f",
+                    ptm_metadata["ptm_num_groups"],
+                    ptm_metadata["ptm_num_mergeable_groups"],
+                    ptm_metadata["ptm_num_mergeable_samples"],
+                    ptm_metadata["ptm_max_group_size"],
+                    ptm_metadata["ptm_avg_group_size"],
+                )
 
         return train_data
 

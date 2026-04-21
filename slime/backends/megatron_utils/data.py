@@ -20,6 +20,7 @@ from slime.utils.prefix_tree_merging_utils import (
     PrefixTreeScheduleContext,
     build_prefix_tree_batch_plan,
     get_prefix_tree_runtime_skip_reason,
+    is_ptm_debug_enabled,
     summarize_prefix_tree_batch_plan,
 )
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -112,9 +113,7 @@ def get_batch(
             else:
                 ptm_runtime_stats["skip_reason"] = "no_runtime_token_reduction"
         enable_ptm_now = enable_prefix_tree_merging and not allgather_cp and cp_size == 1
-        ptm_profile_enabled = profile_timer_prefix is not None and os.environ.get(
-            "SLIME_PTM_LOGPROB_BREAKDOWN", "0"
-        ).strip().lower() in {"1", "true", "yes"}
+        ptm_profile_enabled = profile_timer_prefix is not None and is_ptm_debug_enabled()
         if ptm_profile_enabled and torch.cuda.is_available():
             torch.cuda.synchronize()
             ptm_profile_start = perf_counter()
@@ -468,12 +467,14 @@ def get_data_iterator(
             f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
         )
 
+    ptm_debug_enabled = is_ptm_debug_enabled()
+
     def _add_timing(metric_name: str, elapsed_s: float) -> None:
         if timer_prefix is not None:
             Timer().add(metric_name, elapsed_s)
 
     def _should_log_schedule_details() -> bool:
-        return not dist.is_initialized() or dist.get_rank() == 0
+        return ptm_debug_enabled and (not dist.is_initialized() or dist.get_rank() == 0)
 
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
         data_iterator = []
@@ -567,7 +568,8 @@ def get_data_iterator(
         prefix_lens = rollout_data.get("ptm_prefix_lens")
         if schedule_ctx is None:
             raise ValueError("schedule_ctx is required for PTM-aware dynamic batching")
-        ptm_sched_metrics["build_calls"] += 1
+        if ptm_debug_enabled:
+            ptm_sched_metrics["build_calls"] += 1
 
         def _prefix_len(sample_idx: int) -> int:
             if prefix_lens is None:
@@ -612,12 +614,14 @@ def get_data_iterator(
             overflow_candidates: list[tuple[int, int, int, int, int, int, int]] = []
 
             for slot_idx, bucket in enumerate(buckets):
-                ptm_sched_metrics["candidate_evals"] += 1
-                estimate_start_time = perf_counter()
+                if ptm_debug_enabled:
+                    ptm_sched_metrics["candidate_evals"] += 1
+                    estimate_start_time = perf_counter()
                 candidate_cost, merged_tokens, insert_at = bucket.evaluate_insert(sample_idx, schedule_ctx)
-                ptm_sched_metrics["estimate_time_s"] += perf_counter() - estimate_start_time
-                ptm_sched_metrics["estimate_calls"] += 1
-                ptm_sched_metrics["estimate_cache_misses"] += 1
+                if ptm_debug_enabled:
+                    ptm_sched_metrics["estimate_time_s"] += perf_counter() - estimate_start_time
+                    ptm_sched_metrics["estimate_calls"] += 1
+                    ptm_sched_metrics["estimate_cache_misses"] += 1
                 marginal_cost = candidate_cost - bucket.padded_tokens
                 slack = token_budget - candidate_cost
                 candidate_info = (
@@ -715,7 +719,7 @@ def get_data_iterator(
         ptm_sched_second_pass_elapsed = 0.0
         first_pass_partitions: list[list[list[int]] | None] = [None] * num_steps_per_rollout
         step_schedule_contexts = rollout_data.get("ptm_schedule_contexts")
-        first_pass_start_time = perf_counter()
+        first_pass_start_time = perf_counter() if ptm_debug_enabled else None
         for i in range(num_steps_per_rollout):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             if use_ptm_sched:
@@ -733,7 +737,8 @@ def get_data_iterator(
                 num_microbatches.append(len(step_partitions))
             else:
                 num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], token_budget))
-        ptm_sched_first_pass_elapsed = perf_counter() - first_pass_start_time
+        if ptm_debug_enabled and first_pass_start_time is not None:
+            ptm_sched_first_pass_elapsed = perf_counter() - first_pass_start_time
 
         sync_start_time = perf_counter()
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
@@ -750,7 +755,7 @@ def get_data_iterator(
         sync_elapsed = perf_counter() - sync_start_time
 
         micro_batch_indices = []
-        second_pass_start_time = perf_counter()
+        second_pass_start_time = perf_counter() if ptm_debug_enabled else None
         if use_ptm_sched:
             for i, target_num_mbs in enumerate(num_microbatches):
                 start, end = i * num_local_gbs, (i + 1) * num_local_gbs
@@ -758,7 +763,8 @@ def get_data_iterator(
                 local_first_pass_partitions = first_pass_partitions[i]
                 if local_first_pass_partitions is not None and len(local_first_pass_partitions) == target_num_mbs:
                     partitions = [partition.copy() for partition in local_first_pass_partitions]
-                    ptm_sched_metrics["reused_first_pass_steps"] += 1
+                    if ptm_debug_enabled:
+                        ptm_sched_metrics["reused_first_pass_steps"] += 1
                 else:
                     if step_schedule_contexts is None or i >= len(step_schedule_contexts):
                         raise ValueError(f"Missing ptm_schedule_contexts for step {i}")
@@ -780,13 +786,14 @@ def get_data_iterator(
                     for k in range(len(partitions[j])):
                         partitions[j][k] += start
                 micro_batch_indices.extend(partitions)
-        ptm_sched_second_pass_elapsed = perf_counter() - second_pass_start_time
+        if ptm_debug_enabled and second_pass_start_time is not None:
+            ptm_sched_second_pass_elapsed = perf_counter() - second_pass_start_time
 
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
-        if use_ptm_sched:
+        if use_ptm_sched and ptm_debug_enabled:
             total_ptm_sched_time = ptm_sched_first_pass_elapsed + ptm_sched_second_pass_elapsed
             _add_timing(f"{timer_prefix}_ptm_sched", total_ptm_sched_time)
             _add_timing(f"{timer_prefix}_ptm_sched_first_pass", ptm_sched_first_pass_elapsed)

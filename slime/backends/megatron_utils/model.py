@@ -25,7 +25,11 @@ from megatron.training.training import get_model
 from slime.utils import logging_utils
 from slime.utils.hf_compat import patch_qwen2_rope_theta_compat
 from slime.utils.memory_utils import clear_memory
-from slime.utils.prefix_tree_merging_utils import PrefixTreeMergingContext, log_prefix_tree_context
+from slime.utils.prefix_tree_merging_utils import (
+    PrefixTreeMergingContext,
+    is_ptm_debug_enabled,
+    log_prefix_tree_context,
+)
 from slime.utils.timer import Timer
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -34,13 +38,6 @@ from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
-
-
-_LOGPROB_BREAKDOWN_ENV = "SLIME_PTM_LOGPROB_BREAKDOWN"
-
-
-def _should_profile_logprob_breakdown() -> bool:
-    return os.environ.get(_LOGPROB_BREAKDOWN_ENV, "0").strip().lower() in {"1", "true", "yes"}
 
 
 def _cuda_sync_if_needed() -> None:
@@ -223,7 +220,8 @@ def forward_only(
         nonlocal prefix_tree_log_emitted
 
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
-        breakdown_enabled = _should_profile_logprob_breakdown()
+        ptm_debug_enabled = is_ptm_debug_enabled()
+        breakdown_enabled = ptm_debug_enabled
         profile_timer_prefix = f"{store_prefix}log_probs"
         enable_ptm_runtime = bool(
             getattr(args, "slime_prefix_magi_attention", False)
@@ -293,7 +291,7 @@ def forward_only(
                 elapsed_s * 1000.0,
             )
 
-        if prefix_tree_context is not None and not prefix_tree_log_emitted:
+        if ptm_debug_enabled and prefix_tree_context is not None and not prefix_tree_log_emitted:
             ptm_runtime_stats = batch.get("ptm_runtime_stats") or {}
             extra = {
                 "tokens_shape": tuple(tokens.shape),
@@ -538,7 +536,8 @@ def train_one_step(
             output_tensor = output_tensor.index_select(1, ptm_unmerge_index)
 
         if (
-            prefix_tree_context is not None
+            ptm_debug_enabled
+            and prefix_tree_context is not None
             and prefix_tree_log_emitted is not None
             and not prefix_tree_log_emitted[0]
         ):
