@@ -74,7 +74,6 @@ def get_batch(
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
     tokens = batch["tokens"]
-    group_ids = batch.get("ptm_group_ids")
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -120,7 +119,7 @@ def get_batch(
         else:
             ptm_profile_start = None
         if enable_ptm_now:
-            cheap_skip_reason = get_prefix_tree_runtime_skip_reason(tokens, group_ids=group_ids)
+            cheap_skip_reason = get_prefix_tree_runtime_skip_reason(tokens)
             if cheap_skip_reason is not None:
                 ptm_runtime_stats["skip_reason"] = cheap_skip_reason
             else:

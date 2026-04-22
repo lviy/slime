@@ -553,7 +553,7 @@ def test_prefix_tree_runtime_skip_reason_single_sample_microbatch() -> None:
 
 
 @pytest.mark.unit
-def test_prefix_tree_runtime_skip_reason_no_mergeable_group_overlap() -> None:
+def test_prefix_tree_runtime_skip_reason_ignores_group_metadata() -> None:
     reason = get_prefix_tree_runtime_skip_reason(
         [
             torch.tensor([101, 11, 12, 13], dtype=torch.long),
@@ -562,7 +562,7 @@ def test_prefix_tree_runtime_skip_reason_no_mergeable_group_overlap() -> None:
         group_ids=[0, 1],
     )
 
-    assert reason == "no_mergeable_group_overlap"
+    assert reason is None
 
 
 @pytest.mark.unit
