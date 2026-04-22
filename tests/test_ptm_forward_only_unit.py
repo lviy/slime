@@ -607,6 +607,62 @@ def test_prefix_tree_batch_plan_reduces_range_fragmentation_vs_legacy() -> None:
 
 
 @pytest.mark.unit
+def test_prefix_tree_block_batch_plan_preserves_tree_attention_mask() -> None:
+    token_lists = [
+        [1, 2, 3, 4, 11],
+        [1, 2, 3, 4, 12],
+        [1, 2, 3, 9, 10],
+    ]
+
+    block_plan = build_prefix_tree_batch_plan(token_lists, block_size=4)
+
+    assert block_plan.runtime_block_size == 4
+    assert block_plan.num_input_tokens == 15
+    assert block_plan.num_merged_tokens == 11
+    assert block_plan.num_input_blocks == 3
+    assert block_plan.num_merged_blocks == 2
+    assert block_plan.num_block_suffix_tokens == 3
+    assert len(block_plan.unmerge_index) == block_plan.num_input_tokens
+
+    mask = _materialize_mask_from_plan(block_plan)
+    original_to_merged = []
+    offset = 0
+    for seq in token_lists:
+        original_to_merged.append(block_plan.unmerge_index[offset : offset + len(seq)])
+        offset += len(seq)
+
+    for sample_indices in original_to_merged:
+        for query_pos, query_idx in enumerate(sample_indices):
+            attended = {key_idx for key_pos, key_idx in enumerate(sample_indices) if key_pos <= query_pos}
+            actual = {key_idx for key_idx in sample_indices if mask[query_idx, key_idx]}
+            assert attended <= actual
+            future = {key_idx for key_pos, key_idx in enumerate(sample_indices) if key_pos > query_pos}
+            assert not (future & actual)
+
+
+@pytest.mark.unit
+def test_prefix_tree_block_runtime_estimate_matches_block_plan() -> None:
+    token_lists = [
+        [1, 2, 3, 4, 11],
+        [1, 2, 3, 4, 12],
+        [1, 2, 3, 9, 10],
+    ]
+    schedule_ctx = build_prefix_tree_schedule_context(token_lists, sample_ids=[0, 1, 2])
+
+    estimate = estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
+        schedule_ctx,
+        sample_indices=[0, 1, 2],
+        pad_size=1,
+        block_size=4,
+    )
+    block_plan = build_prefix_tree_batch_plan(token_lists, block_size=4)
+
+    assert estimate.num_input_tokens == block_plan.num_input_tokens
+    assert estimate.num_merged_tokens == block_plan.num_merged_tokens
+    assert estimate.num_forward_tokens == block_plan.num_merged_tokens
+
+
+@pytest.mark.unit
 def test_prefix_tree_runtime_skip_reason_single_sample_microbatch() -> None:
     reason = get_prefix_tree_runtime_skip_reason(
         [torch.tensor([101, 11, 12, 13], dtype=torch.long)],

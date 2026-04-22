@@ -107,6 +107,19 @@ class _RuntimeTrieNode:
 
 
 @dataclass
+class _RuntimeSegmentNode:
+    tokens: list[int]
+    parent: "_RuntimeSegmentNode | None"
+    depth: int
+    children: dict[Any, list["_RuntimeSegmentNode"]]
+    index: int = -1
+
+    @staticmethod
+    def root() -> "_RuntimeSegmentNode":
+        return _RuntimeSegmentNode(tokens=[], parent=None, depth=0, children={})
+
+
+@dataclass
 class PrefixTreeBatchPlan:
     merged_tokens: list[int]
     merged_position_ids: list[int]
@@ -116,6 +129,10 @@ class PrefixTreeBatchPlan:
     unmerge_index: list[int]
     num_input_tokens: int
     num_merged_tokens: int
+    runtime_block_size: int = 1
+    num_input_blocks: int = 0
+    num_merged_blocks: int = 0
+    num_block_suffix_tokens: int = 0
 
 
 @dataclass
@@ -181,6 +198,29 @@ def _merge_contiguous_intervals(intervals: Sequence[tuple[int, int]]) -> list[tu
             continue
         merged[-1] = (merged[-1][0], end)
     return merged
+
+
+def _align_lcp_to_runtime_block(lcp_tokens: int, block_size: int) -> int:
+    block_size = max(int(block_size), 1)
+    lcp_tokens = max(int(lcp_tokens), 0)
+    if block_size <= 1:
+        return lcp_tokens
+    return (lcp_tokens // block_size) * block_size
+
+
+def _runtime_block_fingerprint(tokens: Sequence[int], start: int, block_size: int) -> int:
+    """Return a compact deterministic key for one full runtime PTM block.
+
+    The caller still validates candidate nodes by token equality, so a rare hash
+    collision cannot merge different blocks.
+    """
+
+    mask = (1 << 64) - 1
+    value = 1469598103934665603
+    for offset in range(start, start + block_size):
+        value ^= int(tokens[offset]) & mask
+        value = (value * 1099511628211) & mask
+    return value
 
 
 def _longest_common_prefix(seq_a: Sequence[int], seq_b: Sequence[int]) -> int:
@@ -400,6 +440,7 @@ def estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
     schedule_ctx: PrefixTreeScheduleContext,
     sample_indices: Sequence[int],
     pad_size: int,
+    block_size: int = 1,
 ) -> PrefixTreeRuntimeTokenEstimate:
     """Estimate exact merged/padded tokens for one runtime micro-batch using RMQ.
 
@@ -419,7 +460,10 @@ def estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
     num_input_tokens = sum(schedule_ctx.get_length(sample_idx) for sample_idx in sample_indices)
     num_merged_tokens = num_input_tokens
     for left_rank, right_rank in zip(sorted_ranks, sorted_ranks[1:], strict=False):
-        num_merged_tokens -= schedule_ctx.get_lcp_by_rank(left_rank, right_rank)
+        num_merged_tokens -= _align_lcp_to_runtime_block(
+            schedule_ctx.get_lcp_by_rank(left_rank, right_rank),
+            block_size,
+        )
 
     if pad_size > 1 and num_merged_tokens > 0:
         num_padded_tokens = (pad_size - num_merged_tokens % pad_size) % pad_size
@@ -434,7 +478,207 @@ def estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
     )
 
 
-def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> PrefixTreeBatchPlan:
+def _segment_child_values(node: _RuntimeSegmentNode) -> list[_RuntimeSegmentNode]:
+    children: list[_RuntimeSegmentNode] = []
+    for bucket in node.children.values():
+        children.extend(bucket)
+    return children
+
+
+def _only_segment_child(node: _RuntimeSegmentNode) -> _RuntimeSegmentNode | None:
+    only_child: _RuntimeSegmentNode | None = None
+    for bucket in node.children.values():
+        for child in bucket:
+            if only_child is not None:
+                return None
+            only_child = child
+    return only_child
+
+
+def _linearize_segment_trie(
+    local_root: _RuntimeSegmentNode,
+    sample_paths: Sequence[Sequence[_RuntimeSegmentNode]],
+    num_input_tokens: int,
+    runtime_block_size: int,
+    num_input_blocks: int,
+    num_block_suffix_tokens: int,
+) -> PrefixTreeBatchPlan:
+    merged_tokens: list[int] = []
+    merged_position_ids: list[int] = []
+    q_ranges: list[list[int]] = []
+    k_ranges: list[list[int]] = []
+    attn_type_map: list[int] = []
+    path_segments: list[tuple[int, int]] = []
+
+    def _push_path_segment(segment_start: int, segment_end: int) -> tuple[bool, int]:
+        if path_segments and path_segments[-1][1] == segment_start:
+            prev_start, prev_end = path_segments[-1]
+            path_segments[-1] = (prev_start, segment_end)
+            return True, prev_end
+
+        path_segments.append((segment_start, segment_end))
+        return False, -1
+
+    def _pop_path_segment(merged_with_previous: bool, previous_end: int) -> None:
+        if merged_with_previous:
+            prev_start, _ = path_segments[-1]
+            path_segments[-1] = (prev_start, previous_end)
+            return
+        path_segments.pop()
+
+    local_root.index = -1
+    stack: list[tuple[str, Any]] = [("visit", child) for child in reversed(_segment_child_values(local_root))]
+    while stack:
+        action, payload = stack.pop()
+        if action == "restore_path":
+            merged_with_previous, previous_end = payload
+            _pop_path_segment(bool(merged_with_previous), int(previous_end))
+            continue
+
+        start_node = payload
+
+        chain_nodes: list[_RuntimeSegmentNode] = [start_node]
+        chain_tail = start_node
+        while True:
+            only_child = _only_segment_child(chain_tail)
+            if only_child is None:
+                break
+            chain_tail = only_child
+            chain_nodes.append(chain_tail)
+
+        chain_start = len(merged_tokens)
+        for node in chain_nodes:
+            node.index = len(merged_tokens)
+            token_start_position = node.depth - len(node.tokens)
+            merged_tokens.extend(int(token) for token in node.tokens)
+            merged_position_ids.extend(range(token_start_position, node.depth))
+        chain_end = len(merged_tokens)
+
+        if chain_start != chain_end:
+            merged_with_previous, previous_end = _push_path_segment(chain_start, chain_end)
+            for segment_start, segment_end in path_segments[:-1]:
+                q_ranges.append([chain_start, chain_end])
+                k_ranges.append([segment_start, segment_end])
+                attn_type_map.append(0)
+
+            causal_start, causal_end = path_segments[-1]
+            q_ranges.append([chain_start, chain_end])
+            k_ranges.append([causal_start, causal_end])
+            attn_type_map.append(1)
+            stack.append(("restore_path", (merged_with_previous, previous_end)))
+
+        if chain_tail.children:
+            for child in reversed(_segment_child_values(chain_tail)):
+                stack.append(("visit", child))
+
+    unmerge_index: list[int] = []
+    for path in sample_paths:
+        for node in path:
+            unmerge_index.extend(range(node.index, node.index + len(node.tokens)))
+
+    num_merged_blocks = 0
+    if runtime_block_size > 1:
+        num_merged_blocks = sum(1 for node in _iter_segment_nodes(local_root) if len(node.tokens) == runtime_block_size)
+
+    return PrefixTreeBatchPlan(
+        merged_tokens=merged_tokens,
+        merged_position_ids=merged_position_ids,
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_type_map=attn_type_map,
+        unmerge_index=unmerge_index,
+        num_input_tokens=num_input_tokens,
+        num_merged_tokens=len(merged_tokens),
+        runtime_block_size=runtime_block_size,
+        num_input_blocks=num_input_blocks,
+        num_merged_blocks=num_merged_blocks,
+        num_block_suffix_tokens=num_block_suffix_tokens,
+    )
+
+
+def _iter_segment_nodes(root: _RuntimeSegmentNode) -> Sequence[_RuntimeSegmentNode]:
+    nodes: list[_RuntimeSegmentNode] = []
+    stack = _segment_child_values(root)
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        stack.extend(_segment_child_values(node))
+    return nodes
+
+
+def _build_prefix_tree_block_batch_plan(
+    sequences: Sequence[Sequence[int]],
+    block_size: int,
+) -> PrefixTreeBatchPlan:
+    block_size = max(int(block_size), 1)
+    local_root = _RuntimeSegmentNode.root()
+    sample_paths: list[list[_RuntimeSegmentNode]] = []
+    num_input_blocks = 0
+    num_block_suffix_tokens = 0
+
+    for sample_idx, seq_like in enumerate(sequences):
+        seq = [int(token) for token in seq_like]
+        node = local_root
+        path: list[_RuntimeSegmentNode] = []
+        full_block_tokens = (len(seq) // block_size) * block_size
+        num_input_blocks += full_block_tokens // block_size
+
+        for block_start in range(0, full_block_tokens, block_size):
+            child_key = _runtime_block_fingerprint(seq, block_start, block_size)
+            child_bucket = node.children.get(child_key)
+            child = None
+            block_tokens = None
+            if child_bucket is not None:
+                block_tokens = seq[block_start : block_start + block_size]
+                for candidate in child_bucket:
+                    if candidate.tokens == block_tokens:
+                        child = candidate
+                        break
+            if child is None:
+                if block_tokens is None:
+                    block_tokens = seq[block_start : block_start + block_size]
+                child = _RuntimeSegmentNode(
+                    tokens=block_tokens,
+                    parent=node,
+                    depth=node.depth + block_size,
+                    children={},
+                )
+                if child_bucket is None:
+                    node.children[child_key] = [child]
+                else:
+                    child_bucket.append(child)
+            node = child
+            path.append(node)
+
+        suffix_tokens = seq[full_block_tokens:]
+        if suffix_tokens:
+            num_block_suffix_tokens += len(suffix_tokens)
+            child_key = ("suffix", sample_idx)
+            child = _RuntimeSegmentNode(
+                tokens=suffix_tokens,
+                parent=node,
+                depth=node.depth + len(suffix_tokens),
+                children={},
+            )
+            node.children[child_key] = [child]
+            path.append(child)
+
+        sample_paths.append(path)
+
+    return _linearize_segment_trie(
+        local_root,
+        sample_paths,
+        num_input_tokens=sum(len(seq) for seq in sequences),
+        runtime_block_size=block_size,
+        num_input_blocks=num_input_blocks,
+        num_block_suffix_tokens=num_block_suffix_tokens,
+    )
+
+
+def build_prefix_tree_batch_plan(
+    tokens: Sequence[Sequence[int] | Any],
+    block_size: int = 1,
+) -> PrefixTreeBatchPlan:
     sequences: list[list[int]] = [_as_int_list(t) for t in tokens]
     if len(sequences) == 0:
         return PrefixTreeBatchPlan(
@@ -446,7 +690,12 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
             unmerge_index=[],
             num_input_tokens=0,
             num_merged_tokens=0,
+            runtime_block_size=max(int(block_size), 1),
         )
+
+    block_size = max(int(block_size), 1)
+    if block_size > 1:
+        return _build_prefix_tree_block_batch_plan(sequences, block_size)
 
     local_root = _RuntimeTrieNode.root()
     sample_paths: list[list[_RuntimeTrieNode]] = []

@@ -246,6 +246,7 @@ def forward_only(
             args.allgather_cp,
             enable_prefix_tree_merging=enable_ptm_runtime,
             profile_timer_prefix=profile_timer_prefix if breakdown_enabled else None,
+            prefix_tree_block_size=getattr(args, "slime_prefix_runtime_block_size", 512),
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -328,6 +329,10 @@ def forward_only(
                 "avg_attended_tokens_per_query",
                 "max_q_range_width",
                 "max_k_range_width",
+                "runtime_block_size",
+                "num_input_blocks",
+                "num_merged_blocks",
+                "num_block_suffix_tokens",
                 "original_input_tokens",
                 "original_forward_tokens",
                 "original_padded_tokens",
@@ -499,6 +504,7 @@ def train_one_step(
             args.qkv_format,
             args.allgather_cp,
             enable_prefix_tree_merging=enable_ptm_runtime,
+            prefix_tree_block_size=getattr(args, "slime_prefix_runtime_block_size", 512),
         )
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
@@ -586,6 +592,10 @@ def train_one_step(
                 "avg_attended_tokens_per_query",
                 "max_q_range_width",
                 "max_k_range_width",
+                "runtime_block_size",
+                "num_input_blocks",
+                "num_merged_blocks",
+                "num_block_suffix_tokens",
                 "original_input_tokens",
                 "original_forward_tokens",
                 "original_padded_tokens",

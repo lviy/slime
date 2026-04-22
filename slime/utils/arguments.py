@@ -924,6 +924,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--slime-prefix-runtime-block-size",
+                type=int,
+                default=512,
+                help=(
+                    "Runtime PTM trie block size. Values > 1 merge only full identical token blocks "
+                    "and keep partial-block tails unmerged. Use 1 for exact token-level PTM."
+                ),
+            )
+            parser.add_argument(
                 "--get-mismatch-metrics",
                 action="store_true",
                 default=False,
@@ -1680,6 +1689,8 @@ def slime_validate_args(args):
             raise ValueError(
                 "--slime-prefix-magi-attention currently requires --context-parallel-size 1."
             )
+        if args.slime_prefix_runtime_block_size <= 0:
+            raise ValueError("--slime-prefix-runtime-block-size must be > 0.")
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip

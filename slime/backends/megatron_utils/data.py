@@ -42,6 +42,7 @@ def get_batch(
     allgather_cp: bool = False,
     enable_prefix_tree_merging: bool = False,
     profile_timer_prefix: str | None = None,
+    prefix_tree_block_size: int = 1,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -80,6 +81,7 @@ def get_batch(
     pad_token_id = 0
     tp_size = mpu.get_tensor_model_parallel_world_size()
     pad_size = tp_size * pad_multiplier
+    prefix_tree_block_size = max(int(prefix_tree_block_size), 1)
 
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
@@ -94,6 +96,7 @@ def get_batch(
         "requested": bool(enable_prefix_tree_merging),
         "applied": False,
         "skip_reason": "disabled",
+        "runtime_block_size": prefix_tree_block_size,
     }
 
     if qkv_format == "bshd":
@@ -158,6 +161,7 @@ def get_batch(
                                         schedule_contexts[step_idx],
                                         local_sample_indices,
                                         pad_size=pad_size if tp_size > 1 else 1,
+                                        block_size=prefix_tree_block_size,
                                     )
                                 )
 
@@ -194,11 +198,15 @@ def get_batch(
                     "cheap_gate_no_runtime_token_reduction",
                     "cheap_gate_no_forward_token_reduction",
                 }:
-                    ptm_plan = build_prefix_tree_batch_plan(tokens)
+                    ptm_plan = build_prefix_tree_batch_plan(tokens, block_size=prefix_tree_block_size)
                     ptm_runtime_stats.update(
                         {
                             "num_input_tokens": ptm_plan.num_input_tokens,
                             "num_merged_tokens": ptm_plan.num_merged_tokens,
+                            "runtime_block_size": ptm_plan.runtime_block_size,
+                            "num_input_blocks": ptm_plan.num_input_blocks,
+                            "num_merged_blocks": ptm_plan.num_merged_blocks,
+                            "num_block_suffix_tokens": ptm_plan.num_block_suffix_tokens,
                         }
                     )
                     ptm_runtime_stats.update(summarize_prefix_tree_batch_plan(ptm_plan))
@@ -562,6 +570,7 @@ def get_data_iterator(
         return data_iterator
 
     pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+    ptm_runtime_block_size = max(int(getattr(args, "slime_prefix_runtime_block_size", 1)), 1)
 
     def _pad_ptm_sched_tokens(merged_tokens: int) -> int:
         if merged_tokens <= 0:
@@ -602,11 +611,17 @@ def get_data_iterator(
 
             merged_tokens = self.merged_tokens + schedule_ctx.get_length(sample_idx)
             if prev_rank is not None:
-                merged_tokens -= schedule_ctx.get_lcp_by_rank(prev_rank, rank)
+                merged_tokens -= (
+                    schedule_ctx.get_lcp_by_rank(prev_rank, rank) // ptm_runtime_block_size
+                ) * ptm_runtime_block_size
             if next_rank is not None:
-                merged_tokens -= schedule_ctx.get_lcp_by_rank(rank, next_rank)
+                merged_tokens -= (
+                    schedule_ctx.get_lcp_by_rank(rank, next_rank) // ptm_runtime_block_size
+                ) * ptm_runtime_block_size
             if prev_rank is not None and next_rank is not None:
-                merged_tokens += schedule_ctx.get_lcp_by_rank(prev_rank, next_rank)
+                merged_tokens += (
+                    schedule_ctx.get_lcp_by_rank(prev_rank, next_rank) // ptm_runtime_block_size
+                ) * ptm_runtime_block_size
 
             padded_tokens = _pad_ptm_sched_tokens(merged_tokens)
             return padded_tokens, merged_tokens, insert_at
@@ -882,6 +897,7 @@ def get_data_iterator(
             if _should_log_schedule_details():
                 logger.info(
                     "[PTMScheduler] stage=%s steps=%d token_budget=%d "
+                    "runtime_block_size=%d "
                     "first_pass_time_s=%.3f second_pass_time_s=%.3f sync_time_s=%.3f "
                     "estimate_time_s=%.3f estimate_calls=%d estimate_cache_hits=%d "
                     "estimate_cache_misses=%d candidate_evals=%d build_calls=%d "
@@ -889,6 +905,7 @@ def get_data_iterator(
                     timer_prefix or "data_iterator",
                     num_steps_per_rollout,
                     token_budget,
+                    ptm_runtime_block_size,
                     ptm_sched_first_pass_elapsed,
                     ptm_sched_second_pass_elapsed,
                     sync_elapsed,
