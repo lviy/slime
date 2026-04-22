@@ -55,6 +55,7 @@ DEFAULT_NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", str(max(_DETECTE
 DEFAULT_NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
 PTM_MIN_GROUP_SIZE = int(os.environ.get("SLIME_PTM_E2E_MIN_GROUP_SIZE", "2"))
 PTM_PREFIX_MAX_LEN = os.environ.get("SLIME_PTM_E2E_PREFIX_MAX_LEN")
+PTM_RUNTIME_BLOCK_SIZE = int(os.environ.get("SLIME_PTM_E2E_RUNTIME_BLOCK_SIZE", "512"))
 DEFAULT_TENSOR_MODEL_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_TENSOR_MODEL_PARALLEL_SIZE", "1"))
 DEFAULT_PIPELINE_MODEL_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_PIPELINE_MODEL_PARALLEL_SIZE", "1"))
 DEFAULT_CONTEXT_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_CONTEXT_PARALLEL_SIZE", "1"))
@@ -221,6 +222,15 @@ def build_parser() -> ArgumentParser:
         help=(
             "Optional override for --train-memory-margin-bytes passed to the train job. "
             "Useful for sweeping TorchMemorySaver offload margin without editing the benchmark harness."
+        ),
+    )
+    parser.add_argument(
+        "--slime-prefix-runtime-block-size",
+        type=int,
+        default=PTM_RUNTIME_BLOCK_SIZE,
+        help=(
+            "Runtime PTM trie block size forwarded to train.py. "
+            "Use 1 for exact token-level PTM; values > 1 enable block-level PTM."
         ),
     )
     parser.add_argument(
@@ -498,11 +508,12 @@ def _common_args(
     return f"{ckpt_args} " f"{rollout_args} " f"{optimizer_args} " f"{grpo_args} " f"{perf_args} " f"{misc_args} "
 
 
-def _ptm_args() -> str:
+def _ptm_args(runtime_block_size: int) -> str:
     args = (
         "--slime-prefix-tree-merging "
         "--slime-prefix-magi-attention "
         f"--slime-prefix-min-group-size {PTM_MIN_GROUP_SIZE} "
+        f"--slime-prefix-runtime-block-size {int(runtime_block_size)} "
     )
     if PTM_PREFIX_MAX_LEN:
         args += f"--slime-prefix-max-len {PTM_PREFIX_MAX_LEN} "
@@ -598,6 +609,7 @@ def execute_phase3_only(
     max_tokens_per_gpu: int,
     decoder_last_pipeline_num_layers: int | None,
     train_memory_margin_bytes: int | None,
+    slime_prefix_runtime_block_size: int,
     ptm_enabled: bool,
     save_dir: str,
     save_tag: str,
@@ -622,7 +634,7 @@ def execute_phase3_only(
     if load_debug_rollout_data_subsample is not None:
         phase_args += f"--load-debug-rollout-data-subsample {load_debug_rollout_data_subsample} "
     if ptm_enabled:
-        phase_args += _ptm_args()
+        phase_args += _ptm_args(slime_prefix_runtime_block_size)
 
     print("=" * 80)
     print(f"Phase 3 speed run: {'PTM ON' if ptm_enabled else 'PTM OFF'}")
@@ -732,6 +744,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 max_tokens_per_gpu=args.max_tokens_per_gpu,
                 decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
                 train_memory_margin_bytes=args.train_memory_margin_bytes,
+                slime_prefix_runtime_block_size=args.slime_prefix_runtime_block_size,
                 ptm_enabled=ptm_enabled,
                 save_dir=save_dir,
                 save_tag=run_tag,
@@ -771,6 +784,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 max_tokens_per_gpu=args.max_tokens_per_gpu,
                 decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
                 train_memory_margin_bytes=args.train_memory_margin_bytes,
+                slime_prefix_runtime_block_size=args.slime_prefix_runtime_block_size,
                 ptm_enabled=ptm_enabled,
                 save_dir=save_dir,
                 save_tag=run_tag,

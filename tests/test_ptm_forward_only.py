@@ -53,6 +53,7 @@ DEFAULT_NUM_GPUS = int(os.environ.get("SLIME_PTM_E2E_NUM_GPUS", str(max(_DETECTE
 DEFAULT_NUM_ROLLOUT = int(os.environ.get("SLIME_PTM_E2E_NUM_ROLLOUT", "1"))
 PTM_MIN_GROUP_SIZE = int(os.environ.get("SLIME_PTM_E2E_MIN_GROUP_SIZE", "2"))
 PTM_PREFIX_MAX_LEN = os.environ.get("SLIME_PTM_E2E_PREFIX_MAX_LEN")
+PTM_RUNTIME_BLOCK_SIZE = int(os.environ.get("SLIME_PTM_E2E_RUNTIME_BLOCK_SIZE", "512"))
 DEFAULT_TENSOR_MODEL_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_TENSOR_MODEL_PARALLEL_SIZE", "1"))
 DEFAULT_PIPELINE_MODEL_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_PIPELINE_MODEL_PARALLEL_SIZE", "1"))
 DEFAULT_CONTEXT_PARALLEL_SIZE = int(os.environ.get("SLIME_PTM_E2E_CONTEXT_PARALLEL_SIZE", "1"))
@@ -247,6 +248,15 @@ def build_parser() -> ArgumentParser:
         "--skip-prepare",
         action="store_true",
         help="Skip model/dataset prepare steps if the environment is already ready.",
+    )
+    parser.add_argument(
+        "--slime-prefix-runtime-block-size",
+        type=int,
+        default=PTM_RUNTIME_BLOCK_SIZE,
+        help=(
+            "Runtime PTM trie block size forwarded to train.py. "
+            "Use 1 for exact token-level PTM; values > 1 enable block-level PTM."
+        ),
     )
     parser.add_argument(
         "--ci-test",
@@ -515,11 +525,12 @@ def _common_args(
     return f"{ckpt_args} " f"{rollout_args} " f"{optimizer_args} " f"{grpo_args} " f"{perf_args} " f"{misc_args} "
 
 
-def _ptm_args() -> str:
+def _ptm_args(runtime_block_size: int) -> str:
     args = (
         "--slime-prefix-tree-merging "
         "--slime-prefix-magi-attention "
         f"--slime-prefix-min-group-size {PTM_MIN_GROUP_SIZE} "
+        f"--slime-prefix-runtime-block-size {int(runtime_block_size)} "
     )
     if PTM_PREFIX_MAX_LEN:
         args += f"--slime-prefix-max-len {PTM_PREFIX_MAX_LEN} "
@@ -545,6 +556,7 @@ def execute_phase3_only(
     save_dir: str,
     save_tag: str,
     load_debug_rollout_data_subsample: float | None,
+    slime_prefix_runtime_block_size: int,
     ci_test: bool,
 ) -> None:
     resolved_rollout_pt = _expand_rollout_pt_template(rollout_pt) if num_rollout > 1 else rollout_pt
@@ -562,7 +574,7 @@ def execute_phase3_only(
         phase_args += "--ci-test "
     if load_debug_rollout_data_subsample is not None:
         phase_args += f"--load-debug-rollout-data-subsample {load_debug_rollout_data_subsample} "
-    phase_args += _ptm_args()
+    phase_args += _ptm_args(slime_prefix_runtime_block_size)
 
     print("=" * 80)
     print("Phase 3 only: train-only (PTM ON) from pre-generated rollout .pt")
@@ -638,6 +650,7 @@ def main() -> None:
         save_dir=save_dir,
         save_tag=args.save_tag,
         load_debug_rollout_data_subsample=args.load_debug_rollout_data_subsample,
+        slime_prefix_runtime_block_size=args.slime_prefix_runtime_block_size,
         ci_test=args.ci_test,
     )
 

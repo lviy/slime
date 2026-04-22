@@ -36,6 +36,7 @@ ATOL = float(os.environ.get("SLIME_PTM_E2E_ATOL", "0.0"))
 RTOL = float(os.environ.get("SLIME_PTM_E2E_RTOL", "0.0"))
 PTM_MIN_GROUP_SIZE = int(os.environ.get("SLIME_PTM_E2E_MIN_GROUP_SIZE", "2"))
 PTM_PREFIX_MAX_LEN = os.environ.get("SLIME_PTM_E2E_PREFIX_MAX_LEN")
+PTM_RUNTIME_BLOCK_SIZE = int(os.environ.get("SLIME_PTM_E2E_RUNTIME_BLOCK_SIZE", "512"))
 
 
 def _build_runtime_ld_library_path() -> str:
@@ -166,8 +167,12 @@ def _common_args() -> str:
     return f"{ckpt_args} " f"{rollout_args} " f"{optimizer_args} " f"{grpo_args} " f"{perf_args} " f"{misc_args} "
 
 
-def _ptm_args() -> str:
-    args = f"--slime-prefix-tree-merging --slime-prefix-min-group-size {PTM_MIN_GROUP_SIZE} "
+def _ptm_args(runtime_block_size: int) -> str:
+    args = (
+        f"--slime-prefix-tree-merging "
+        f"--slime-prefix-min-group-size {PTM_MIN_GROUP_SIZE} "
+        f"--slime-prefix-runtime-block-size {int(runtime_block_size)} "
+    )
     if PTM_PREFIX_MAX_LEN:
         args += f"--slime-prefix-max-len {PTM_PREFIX_MAX_LEN} "
     return args
@@ -213,7 +218,7 @@ def execute_train_only(debug_data_dir: str, *, ptm_enabled: bool, tag: str) -> N
         "--ci-test "
     )
     if ptm_enabled:
-        phase_args += _ptm_args()
+        phase_args += _ptm_args(PTM_RUNTIME_BLOCK_SIZE)
 
     print("=" * 80)
     print(f"Phase {'3' if ptm_enabled else '2'}: train-only ({'PTM ON' if ptm_enabled else 'PTM OFF'})")
