@@ -22,6 +22,7 @@ from slime.utils.prefix_tree_merging_utils import (
     build_prefix_tree_context_from_rollout_data,
     build_prefix_tree_schedule_context,
     estimate_prefix_tree_merged_token_count,
+    estimate_prefix_tree_runtime_batch_tokens_from_schedule_context,
     get_prefix_tree_runtime_skip_reason,
     summarize_prefix_tree_batch_plan,
 )
@@ -501,6 +502,69 @@ def test_prefix_tree_schedule_context_exact_incremental_bucket_cost() -> None:
         [token_lists[idx] for idx in [*bucket_sample_ids, sample_to_insert]]
     )
     assert incremental_merged == expected_merged
+
+
+@pytest.mark.unit
+def test_prefix_tree_schedule_context_exact_runtime_batch_estimate() -> None:
+    token_lists = [
+        [101, 11, 12, 13],
+        [101, 11, 12, 99],
+        [101, 11, 55],
+        [7, 8],
+    ]
+    schedule_ctx = build_prefix_tree_schedule_context(token_lists, sample_ids=[0, 1, 2, 3])
+
+    estimate = estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
+        schedule_ctx,
+        sample_indices=[2, 0, 1],
+        pad_size=8,
+    )
+    full_plan = build_prefix_tree_batch_plan([token_lists[idx] for idx in [2, 0, 1]])
+
+    assert estimate.num_input_tokens == full_plan.num_input_tokens
+    assert estimate.num_merged_tokens == full_plan.num_merged_tokens
+    assert estimate.num_forward_tokens == 8
+    assert estimate.num_padded_tokens == 2
+
+
+@pytest.mark.unit
+def test_prefix_tree_schedule_context_runtime_estimate_handles_padding_gate() -> None:
+    token_lists = [
+        [101, 11, 12, 13],
+        [101, 11, 12, 99],
+    ]
+    schedule_ctx = build_prefix_tree_schedule_context(token_lists, sample_ids=[10, 20])
+
+    estimate = estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
+        schedule_ctx,
+        sample_indices=[10, 20],
+        pad_size=8,
+    )
+
+    assert estimate.num_input_tokens == 8
+    assert estimate.num_merged_tokens == 5
+    assert estimate.num_forward_tokens == 8
+    assert estimate.num_forward_tokens >= estimate.num_input_tokens
+
+
+@pytest.mark.unit
+def test_prefix_tree_schedule_context_runtime_estimate_detects_no_token_reduction() -> None:
+    token_lists = [
+        [101, 11],
+        [202, 22],
+        [303, 33],
+    ]
+    schedule_ctx = build_prefix_tree_schedule_context(token_lists, sample_ids=[0, 1, 2])
+
+    estimate = estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
+        schedule_ctx,
+        sample_indices=[0, 1, 2],
+        pad_size=8,
+    )
+
+    assert estimate.num_input_tokens == 6
+    assert estimate.num_merged_tokens == 6
+    assert estimate.num_forward_tokens == 8
 
 
 @pytest.mark.unit

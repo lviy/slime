@@ -328,6 +328,14 @@ def forward_only(
                 "avg_attended_tokens_per_query",
                 "max_q_range_width",
                 "max_k_range_width",
+                "original_input_tokens",
+                "original_forward_tokens",
+                "original_padded_tokens",
+                "cheap_gate_input_tokens",
+                "cheap_gate_merged_tokens",
+                "cheap_gate_forward_tokens",
+                "cheap_gate_padded_tokens",
+                "cheap_gate_passed",
             ):
                 if key in ptm_runtime_stats:
                     extra[f"ptm_runtime_{key}"] = ptm_runtime_stats[key]
@@ -578,6 +586,14 @@ def train_one_step(
                 "avg_attended_tokens_per_query",
                 "max_q_range_width",
                 "max_k_range_width",
+                "original_input_tokens",
+                "original_forward_tokens",
+                "original_padded_tokens",
+                "cheap_gate_input_tokens",
+                "cheap_gate_merged_tokens",
+                "cheap_gate_forward_tokens",
+                "cheap_gate_padded_tokens",
+                "cheap_gate_passed",
             ):
                 if key in ptm_runtime_stats:
                     extra[f"ptm_runtime_{key}"] = ptm_runtime_stats[key]

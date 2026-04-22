@@ -19,6 +19,7 @@ from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.prefix_tree_merging_utils import (
     PrefixTreeScheduleContext,
     build_prefix_tree_batch_plan,
+    estimate_prefix_tree_runtime_batch_tokens_from_schedule_context,
     get_prefix_tree_runtime_skip_reason,
     is_ptm_debug_enabled,
     summarize_prefix_tree_batch_plan,
@@ -74,6 +75,7 @@ def get_batch(
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
     tokens = batch["tokens"]
+    local_sample_indices = batch.get("local_sample_indices")
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -123,67 +125,136 @@ def get_batch(
             if cheap_skip_reason is not None:
                 ptm_runtime_stats["skip_reason"] = cheap_skip_reason
             else:
-                ptm_plan = build_prefix_tree_batch_plan(tokens)
+                original_input_tokens = sum(int(t.size(0)) for t in tokens)
+                original_pad = (pad_size - original_input_tokens % pad_size) % pad_size
+                original_forward_tokens = original_input_tokens + original_pad
                 ptm_runtime_stats.update(
                     {
-                        "num_input_tokens": ptm_plan.num_input_tokens,
-                        "num_merged_tokens": ptm_plan.num_merged_tokens,
+                        "original_input_tokens": original_input_tokens,
+                        "original_forward_tokens": original_forward_tokens,
+                        "original_padded_tokens": original_pad,
                     }
                 )
-                ptm_runtime_stats.update(summarize_prefix_tree_batch_plan(ptm_plan))
-                if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
-                    device = tokens[0].device
-                    dtype = tokens[0].dtype
-                    merged_tokens = torch.tensor(ptm_plan.merged_tokens, dtype=dtype, device=device)
-                    merged_position_ids = torch.tensor(
-                        ptm_plan.merged_position_ids, dtype=torch.long, device=device
-                    )
-                    # PTM still runs in THD/CP=1 mode, but TP/sequence parallel may require
-                    # the token stream length to be padded to a TP-aligned multiple.
-                    ptm_pad = (pad_size - merged_tokens.size(0) % pad_size) % pad_size if tp_size > 1 else 0
-                    if ptm_pad != 0:
-                        merged_tokens = F.pad(merged_tokens, (0, ptm_pad), value=pad_token_id)
-                        merged_position_ids = F.pad(merged_position_ids, (0, ptm_pad), value=0)
-                    cu_seqlens = torch.tensor(
-                        [0, merged_tokens.size(0)], dtype=torch.int, device=torch.cuda.current_device()
-                    )
-                    max_seqlen = merged_tokens.size(0)
-                    packed_seq_params = PackedSeqParams(
-                        cu_seqlens_q=cu_seqlens,
-                        cu_seqlens_kv=cu_seqlens,
-                        max_seqlen_q=max_seqlen,
-                        max_seqlen_kv=max_seqlen,
-                        qkv_format="thd",
-                    )
-                    # Keep the constructor ABI compatible with older Megatron runtimes used
-                    # in cloud jobs, then attach PTM metadata dynamically.
-                    packed_seq_params.ptm_q_ranges = torch.tensor(
-                        ptm_plan.q_ranges, dtype=torch.int32, device=torch.cuda.current_device()
-                    )
-                    packed_seq_params.ptm_k_ranges = torch.tensor(
-                        ptm_plan.k_ranges, dtype=torch.int32, device=torch.cuda.current_device()
-                    )
-                    packed_seq_params.ptm_attn_type_map = torch.tensor(
-                        ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
-                    )
-                    packed_seq_params.ptm_q_ranges_non_overlapped = bool(
-                        ptm_runtime_stats.get("q_ranges_non_overlapped", 0)
-                    )
-                    packed_seq_params.explicit_position_ids = True
-                    tokens = merged_tokens.unsqueeze(0)
-                    batch["position_ids"] = merged_position_ids.unsqueeze(0)
-                    batch["ptm_unmerge_index"] = torch.tensor(
-                        ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
-                    )
+
+                exact_runtime_estimate = None
+                schedule_contexts = data_iterator.rollout_data.get("ptm_schedule_contexts")
+                if (
+                    schedule_contexts is not None
+                    and local_sample_indices is not None
+                    and len(local_sample_indices) > 0
+                    and len(schedule_contexts) > 0
+                ):
+                    num_local_samples = len(data_iterator.rollout_data["total_lengths"])
+                    if num_local_samples % len(schedule_contexts) == 0:
+                        num_local_gbs = num_local_samples // len(schedule_contexts)
+                        if num_local_gbs > 0:
+                            step_idx = local_sample_indices[0] // num_local_gbs
+                            if (
+                                all(sample_idx // num_local_gbs == step_idx for sample_idx in local_sample_indices)
+                                and step_idx < len(schedule_contexts)
+                            ):
+                                exact_runtime_estimate = (
+                                    estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
+                                        schedule_contexts[step_idx],
+                                        local_sample_indices,
+                                        pad_size=pad_size if tp_size > 1 else 1,
+                                    )
+                                )
+
+                if exact_runtime_estimate is not None:
                     ptm_runtime_stats.update(
                         {
-                            "applied": True,
-                            "skip_reason": "applied",
-                            "max_position_id": max(ptm_plan.merged_position_ids, default=-1),
-                            "num_unique_position_ids": len(set(ptm_plan.merged_position_ids)),
+                            "cheap_gate_input_tokens": exact_runtime_estimate.num_input_tokens,
+                            "cheap_gate_merged_tokens": exact_runtime_estimate.num_merged_tokens,
+                            "cheap_gate_forward_tokens": exact_runtime_estimate.num_forward_tokens,
+                            "cheap_gate_padded_tokens": exact_runtime_estimate.num_padded_tokens,
+                            "cheap_gate_passed": False,
                         }
                     )
-                    ptm_applied = True
+                    if exact_runtime_estimate.num_merged_tokens >= exact_runtime_estimate.num_input_tokens:
+                        ptm_runtime_stats.update(
+                            {
+                                "skip_reason": "cheap_gate_no_runtime_token_reduction",
+                                "num_input_tokens": exact_runtime_estimate.num_input_tokens,
+                                "num_merged_tokens": exact_runtime_estimate.num_merged_tokens,
+                            }
+                        )
+                    elif exact_runtime_estimate.num_forward_tokens >= original_forward_tokens:
+                        ptm_runtime_stats.update(
+                            {
+                                "skip_reason": "cheap_gate_no_forward_token_reduction",
+                                "num_input_tokens": exact_runtime_estimate.num_input_tokens,
+                                "num_merged_tokens": exact_runtime_estimate.num_merged_tokens,
+                            }
+                        )
+                    else:
+                        ptm_runtime_stats["cheap_gate_passed"] = True
+
+                if ptm_runtime_stats.get("skip_reason") not in {
+                    "cheap_gate_no_runtime_token_reduction",
+                    "cheap_gate_no_forward_token_reduction",
+                }:
+                    ptm_plan = build_prefix_tree_batch_plan(tokens)
+                    ptm_runtime_stats.update(
+                        {
+                            "num_input_tokens": ptm_plan.num_input_tokens,
+                            "num_merged_tokens": ptm_plan.num_merged_tokens,
+                        }
+                    )
+                    ptm_runtime_stats.update(summarize_prefix_tree_batch_plan(ptm_plan))
+                    if 0 < ptm_plan.num_merged_tokens < ptm_plan.num_input_tokens:
+                        device = tokens[0].device
+                        dtype = tokens[0].dtype
+                        merged_tokens = torch.tensor(ptm_plan.merged_tokens, dtype=dtype, device=device)
+                        merged_position_ids = torch.tensor(
+                            ptm_plan.merged_position_ids, dtype=torch.long, device=device
+                        )
+                        # PTM still runs in THD/CP=1 mode, but TP/sequence parallel may require
+                        # the token stream length to be padded to a TP-aligned multiple.
+                        ptm_pad = (pad_size - merged_tokens.size(0) % pad_size) % pad_size if tp_size > 1 else 0
+                        if ptm_pad != 0:
+                            merged_tokens = F.pad(merged_tokens, (0, ptm_pad), value=pad_token_id)
+                            merged_position_ids = F.pad(merged_position_ids, (0, ptm_pad), value=0)
+                        cu_seqlens = torch.tensor(
+                            [0, merged_tokens.size(0)], dtype=torch.int, device=torch.cuda.current_device()
+                        )
+                        max_seqlen = merged_tokens.size(0)
+                        packed_seq_params = PackedSeqParams(
+                            cu_seqlens_q=cu_seqlens,
+                            cu_seqlens_kv=cu_seqlens,
+                            max_seqlen_q=max_seqlen,
+                            max_seqlen_kv=max_seqlen,
+                            qkv_format="thd",
+                        )
+                        # Keep the constructor ABI compatible with older Megatron runtimes used
+                        # in cloud jobs, then attach PTM metadata dynamically.
+                        packed_seq_params.ptm_q_ranges = torch.tensor(
+                            ptm_plan.q_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                        )
+                        packed_seq_params.ptm_k_ranges = torch.tensor(
+                            ptm_plan.k_ranges, dtype=torch.int32, device=torch.cuda.current_device()
+                        )
+                        packed_seq_params.ptm_attn_type_map = torch.tensor(
+                            ptm_plan.attn_type_map, dtype=torch.int32, device=torch.cuda.current_device()
+                        )
+                        packed_seq_params.ptm_q_ranges_non_overlapped = bool(
+                            ptm_runtime_stats.get("q_ranges_non_overlapped", 0)
+                        )
+                        packed_seq_params.explicit_position_ids = True
+                        tokens = merged_tokens.unsqueeze(0)
+                        batch["position_ids"] = merged_position_ids.unsqueeze(0)
+                        batch["ptm_unmerge_index"] = torch.tensor(
+                            ptm_plan.unmerge_index, dtype=torch.long, device=torch.cuda.current_device()
+                        )
+                        ptm_runtime_stats.update(
+                            {
+                                "applied": True,
+                                "skip_reason": "applied",
+                                "max_position_id": max(ptm_plan.merged_position_ids, default=-1),
+                                "num_unique_position_ids": len(set(ptm_plan.merged_position_ids)),
+                            }
+                        )
+                        ptm_applied = True
         if ptm_profile_start is not None:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -389,19 +460,25 @@ class DataIterator:
         Returns a dict mapping each key to a list subset (or None if absent).
         """
         batch = {}
+        if self.micro_batch_indices is not None:
+            local_sample_indices = [int(idx) for idx in self.micro_batch_indices[self.offset]]
+        else:
+            batch_size = int(self.micro_batch_size)
+            local_sample_indices = list(range(self.offset, self.offset + batch_size))
         for key in keys:
             vals = self.rollout_data.get(key, None)
             if vals is None:
                 batch[key] = None
             else:
                 if self.micro_batch_indices is not None:
-                    indices = self.micro_batch_indices[self.offset]
-                    batch[key] = [vals[i] for i in indices]
+                    batch[key] = [vals[i] for i in local_sample_indices]
                 else:
                     assert self.offset + self.micro_batch_size <= len(
                         vals
                     ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}"
                     batch[key] = vals[self.offset : self.offset + self.micro_batch_size]
+
+        batch["local_sample_indices"] = local_sample_indices
 
         if self.micro_batch_indices is not None:
             self.offset += 1

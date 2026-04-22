@@ -159,6 +159,16 @@ class PrefixTreeScheduleContext:
         )
 
 
+@dataclass
+class PrefixTreeRuntimeTokenEstimate:
+    """Exact PTM token estimate derived from a rollout step RMQ schedule context."""
+
+    num_input_tokens: int
+    num_merged_tokens: int
+    num_forward_tokens: int
+    num_padded_tokens: int
+
+
 def _merge_contiguous_intervals(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge tangent intervals into maximal contiguous segments."""
 
@@ -384,6 +394,44 @@ def get_prefix_tree_runtime_skip_reason(
         return "single_sample_microbatch"
 
     return None
+
+
+def estimate_prefix_tree_runtime_batch_tokens_from_schedule_context(
+    schedule_ctx: PrefixTreeScheduleContext,
+    sample_indices: Sequence[int],
+    pad_size: int,
+) -> PrefixTreeRuntimeTokenEstimate:
+    """Estimate exact merged/padded tokens for one runtime micro-batch using RMQ.
+
+    The input `sample_indices` must refer to local sample ids from the same rollout
+    step used to build `schedule_ctx`.
+    """
+
+    if len(sample_indices) == 0:
+        return PrefixTreeRuntimeTokenEstimate(
+            num_input_tokens=0,
+            num_merged_tokens=0,
+            num_forward_tokens=0,
+            num_padded_tokens=0,
+        )
+
+    sorted_ranks = sorted(schedule_ctx.get_rank(sample_idx) for sample_idx in sample_indices)
+    num_input_tokens = sum(schedule_ctx.get_length(sample_idx) for sample_idx in sample_indices)
+    num_merged_tokens = num_input_tokens
+    for left_rank, right_rank in zip(sorted_ranks, sorted_ranks[1:], strict=False):
+        num_merged_tokens -= schedule_ctx.get_lcp_by_rank(left_rank, right_rank)
+
+    if pad_size > 1 and num_merged_tokens > 0:
+        num_padded_tokens = (pad_size - num_merged_tokens % pad_size) % pad_size
+    else:
+        num_padded_tokens = 0
+
+    return PrefixTreeRuntimeTokenEstimate(
+        num_input_tokens=num_input_tokens,
+        num_merged_tokens=num_merged_tokens,
+        num_forward_tokens=num_merged_tokens + num_padded_tokens,
+        num_padded_tokens=num_padded_tokens,
+    )
 
 
 def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> PrefixTreeBatchPlan:
