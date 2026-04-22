@@ -20,7 +20,7 @@ from slime.utils import train_dump_utils
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.logging_utils import init_tracking
-from slime.utils.memory_utils import clear_memory, print_memory
+from slime.utils.memory_utils import clear_memory, print_cuda_memory_stats, print_memory
 from slime.utils.prefix_tree_merging_utils import (
     build_prefix_tree_context_from_rollout_data,
     format_ptm_debug_timing_metrics,
@@ -174,13 +174,14 @@ class MegatronTrainRayActor(TrainRayActor):
         timings: dict[str, float],
         total_time: float,
         reason: str,
+        extra_metrics: dict[str, object] | None = None,
     ) -> None:
         if not is_ptm_debug_enabled():
             return
 
         role = getattr(self, "role", None)
         rank = getattr(self.args, "rank", getattr(self, "_rank", None))
-        extra_metrics = {
+        metrics: dict[str, object] = {
             "transition": transition,
             "reason": reason,
             "rank": int(rank) if rank is not None else None,
@@ -188,9 +189,11 @@ class MegatronTrainRayActor(TrainRayActor):
             "call_idx": int(getattr(self, f"_{transition}_call_idx", 0)),
             f"perf/{transition}_time": total_time,
         }
+        if extra_metrics:
+            metrics.update(extra_metrics)
         logger.info(
             f"[PTMDebug] {transition} breakdown: "
-            f"{format_ptm_debug_timing_metrics(timings, extra_metrics=extra_metrics)}"
+            f"{format_ptm_debug_timing_metrics(timings, extra_metrics=metrics)}"
         )
 
     @timer
@@ -202,9 +205,11 @@ class MegatronTrainRayActor(TrainRayActor):
             self._sleep_call_idx = getattr(self, "_sleep_call_idx", 0) + 1
             sleep_total_start = perf_counter()
             sleep_timings: dict[str, float] = {}
+            pre_clear_cuda_stats = print_cuda_memory_stats(f"before {reason} clear_memory")
         else:
             sleep_total_start = None
             sleep_timings = {}
+            pre_clear_cuda_stats = None
 
         clear_memory_start = perf_counter() if ptm_debug_enabled else None
         clear_memory(clear_host_memory=True)
@@ -213,6 +218,10 @@ class MegatronTrainRayActor(TrainRayActor):
             Timer().add("sleep_clear_memory", elapsed)
             sleep_timings["sleep_clear_memory"] = elapsed
         print_memory("before offload model")
+        if ptm_debug_enabled:
+            pre_pause_cuda_stats = print_cuda_memory_stats(f"before {reason} torch_memory_saver.pause")
+        else:
+            pre_pause_cuda_stats = None
 
         destroy_pg_start = perf_counter() if ptm_debug_enabled else None
         destroy_process_groups()
@@ -229,12 +238,47 @@ class MegatronTrainRayActor(TrainRayActor):
             sleep_timings["sleep_torch_memory_saver_pause"] = elapsed
 
         print_memory("after offload model")
+        if ptm_debug_enabled:
+            post_pause_cuda_stats = print_cuda_memory_stats(f"after {reason} torch_memory_saver.pause")
+        else:
+            post_pause_cuda_stats = None
         if sleep_total_start is not None:
             self._log_ptm_debug_offload_transition(
                 transition="sleep",
                 timings=sleep_timings,
                 total_time=perf_counter() - sleep_total_start,
                 reason=reason,
+                extra_metrics={
+                    "pre_clear_reserved_GB": None if pre_clear_cuda_stats is None else pre_clear_cuda_stats["reserved_GB"],
+                    "pre_clear_active_GB": None if pre_clear_cuda_stats is None else pre_clear_cuda_stats["active_GB"],
+                    "pre_clear_inactive_split_GB": (
+                        None if pre_clear_cuda_stats is None else pre_clear_cuda_stats["inactive_split_GB"]
+                    ),
+                    "pre_clear_alloc_retries": (
+                        None if pre_clear_cuda_stats is None else pre_clear_cuda_stats["alloc_retries"]
+                    ),
+                    "pre_clear_ooms": None if pre_clear_cuda_stats is None else pre_clear_cuda_stats["ooms"],
+                    "pre_pause_reserved_GB": None if pre_pause_cuda_stats is None else pre_pause_cuda_stats["reserved_GB"],
+                    "pre_pause_active_GB": None if pre_pause_cuda_stats is None else pre_pause_cuda_stats["active_GB"],
+                    "pre_pause_inactive_split_GB": (
+                        None if pre_pause_cuda_stats is None else pre_pause_cuda_stats["inactive_split_GB"]
+                    ),
+                    "pre_pause_alloc_retries": (
+                        None if pre_pause_cuda_stats is None else pre_pause_cuda_stats["alloc_retries"]
+                    ),
+                    "pre_pause_ooms": None if pre_pause_cuda_stats is None else pre_pause_cuda_stats["ooms"],
+                    "post_pause_reserved_GB": (
+                        None if post_pause_cuda_stats is None else post_pause_cuda_stats["reserved_GB"]
+                    ),
+                    "post_pause_active_GB": None if post_pause_cuda_stats is None else post_pause_cuda_stats["active_GB"],
+                    "post_pause_inactive_split_GB": (
+                        None if post_pause_cuda_stats is None else post_pause_cuda_stats["inactive_split_GB"]
+                    ),
+                    "post_pause_alloc_retries": (
+                        None if post_pause_cuda_stats is None else post_pause_cuda_stats["alloc_retries"]
+                    ),
+                    "post_pause_ooms": None if post_pause_cuda_stats is None else post_pause_cuda_stats["ooms"],
+                },
             )
 
     @timer
@@ -245,9 +289,11 @@ class MegatronTrainRayActor(TrainRayActor):
             self._wake_up_call_idx = getattr(self, "_wake_up_call_idx", 0) + 1
             wake_total_start = perf_counter()
             wake_timings: dict[str, float] = {}
+            pre_resume_cuda_stats = print_cuda_memory_stats(f"before {reason} torch_memory_saver.resume")
         else:
             wake_total_start = None
             wake_timings = {}
+            pre_resume_cuda_stats = None
         print_memory("before wake_up model")
 
         resume_start = perf_counter() if ptm_debug_enabled else None
@@ -271,12 +317,42 @@ class MegatronTrainRayActor(TrainRayActor):
             Timer().add("wake_up_reload_process_groups", elapsed)
             wake_timings["wake_up_reload_process_groups"] = elapsed
         print_memory("after wake_up model")
+        if ptm_debug_enabled:
+            post_resume_cuda_stats = print_cuda_memory_stats(f"after {reason} torch_memory_saver.resume")
+        else:
+            post_resume_cuda_stats = None
         if wake_total_start is not None:
             self._log_ptm_debug_offload_transition(
                 transition="wake_up",
                 timings=wake_timings,
                 total_time=perf_counter() - wake_total_start,
                 reason=reason,
+                extra_metrics={
+                    "pre_resume_reserved_GB": (
+                        None if pre_resume_cuda_stats is None else pre_resume_cuda_stats["reserved_GB"]
+                    ),
+                    "pre_resume_active_GB": None if pre_resume_cuda_stats is None else pre_resume_cuda_stats["active_GB"],
+                    "pre_resume_inactive_split_GB": (
+                        None if pre_resume_cuda_stats is None else pre_resume_cuda_stats["inactive_split_GB"]
+                    ),
+                    "pre_resume_alloc_retries": (
+                        None if pre_resume_cuda_stats is None else pre_resume_cuda_stats["alloc_retries"]
+                    ),
+                    "pre_resume_ooms": None if pre_resume_cuda_stats is None else pre_resume_cuda_stats["ooms"],
+                    "post_resume_reserved_GB": (
+                        None if post_resume_cuda_stats is None else post_resume_cuda_stats["reserved_GB"]
+                    ),
+                    "post_resume_active_GB": (
+                        None if post_resume_cuda_stats is None else post_resume_cuda_stats["active_GB"]
+                    ),
+                    "post_resume_inactive_split_GB": (
+                        None if post_resume_cuda_stats is None else post_resume_cuda_stats["inactive_split_GB"]
+                    ),
+                    "post_resume_alloc_retries": (
+                        None if post_resume_cuda_stats is None else post_resume_cuda_stats["alloc_retries"]
+                    ),
+                    "post_resume_ooms": None if post_resume_cuda_stats is None else post_resume_cuda_stats["ooms"],
+                },
             )
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:

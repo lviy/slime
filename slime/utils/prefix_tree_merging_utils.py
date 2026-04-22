@@ -267,18 +267,30 @@ def build_prefix_tree_schedule_context(
     )
 
 
-def summarize_prefix_tree_batch_plan(plan: PrefixTreeBatchPlan) -> dict[str, int | float]:
-    """Summarize PTM arbitrary-range metadata size for lightweight diagnostics."""
+def summarize_prefix_tree_batch_plan(
+    plan: PrefixTreeBatchPlan,
+    include_query_coverage: bool = True,
+) -> dict[str, int | float]:
+    """Summarize PTM arbitrary-range metadata size for lightweight diagnostics.
+
+    Args:
+        plan: Runtime PTM batch plan.
+        include_query_coverage: Whether to derive per-query range coverage metrics
+            such as ``max_ranges_per_query``. Disable this on hot paths when only
+            structural stats (for example ``q_ranges_non_overlapped``) are needed.
+    """
 
     num_queries = int(plan.num_merged_tokens)
     num_q_ranges = len(plan.q_ranges)
     num_k_ranges = len(plan.k_ranges)
-    ranges_per_query = [0] * num_queries
+    range_count_deltas = [0] * (num_queries + 1) if include_query_coverage and num_queries > 0 else None
     total_q_range_tokens = 0
     total_k_range_tokens = 0
     max_q_range_width = 0
     max_k_range_width = 0
     q_range_pairs: list[tuple[int, int]] = []
+    q_ranges_in_non_decreasing_order = True
+    prev_q_start: int | None = None
 
     for q_range, k_range in zip(plan.q_ranges, plan.k_ranges, strict=True):
         q_start, q_end = int(q_range[0]), int(q_range[1])
@@ -286,38 +298,40 @@ def summarize_prefix_tree_batch_plan(plan: PrefixTreeBatchPlan) -> dict[str, int
         q_width = max(q_end - q_start, 0)
         k_width = max(k_end - k_start, 0)
         q_range_pairs.append((q_start, q_end))
+        if prev_q_start is not None and q_start < prev_q_start:
+            q_ranges_in_non_decreasing_order = False
+        prev_q_start = q_start
 
         total_q_range_tokens += q_width
         total_k_range_tokens += k_width
         max_q_range_width = max(max_q_range_width, q_width)
         max_k_range_width = max(max_k_range_width, k_width)
 
-        upper = min(q_end, num_queries)
-        for q_idx in range(max(q_start, 0), upper):
-            ranges_per_query[q_idx] += 1
+        if range_count_deltas is not None:
+            clamped_start = min(max(q_start, 0), num_queries)
+            clamped_end = min(max(q_end, 0), num_queries)
+            if clamped_start < clamped_end:
+                range_count_deltas[clamped_start] += 1
+                range_count_deltas[clamped_end] -= 1
 
-    queries_with_multiple_ranges = sum(1 for count in ranges_per_query if count > 1)
-    max_ranges_per_query = max(ranges_per_query, default=0)
     unique_q_ranges = len(set(q_range_pairs))
     duplicated_q_ranges = num_q_ranges - unique_q_ranges
     q_ranges_non_overlapped = 1
-    sorted_q_range_pairs = sorted(q_range_pairs)
+    ordered_q_range_pairs = q_range_pairs if q_ranges_in_non_decreasing_order else sorted(q_range_pairs)
     prev_end: int | None = None
-    for q_start, q_end in sorted_q_range_pairs:
+    for q_start, q_end in ordered_q_range_pairs:
         if prev_end is not None and q_start < prev_end:
             q_ranges_non_overlapped = 0
             break
         prev_end = q_end
 
-    return {
+    summary: dict[str, int | float] = {
         "num_q_ranges": num_q_ranges,
         "num_k_ranges": num_k_ranges,
         "num_unique_q_ranges": unique_q_ranges,
         "num_duplicated_q_ranges": duplicated_q_ranges,
         "q_ranges_non_overlapped": q_ranges_non_overlapped,
         "avg_ranges_per_query": (num_q_ranges / num_queries) if num_queries > 0 else 0.0,
-        "max_ranges_per_query": max_ranges_per_query,
-        "queries_with_multiple_ranges": queries_with_multiple_ranges,
         "total_q_range_tokens": total_q_range_tokens,
         "total_k_range_tokens": total_k_range_tokens,
         "avg_q_range_width": (total_q_range_tokens / num_q_ranges) if num_q_ranges > 0 else 0.0,
@@ -326,6 +340,31 @@ def summarize_prefix_tree_batch_plan(plan: PrefixTreeBatchPlan) -> dict[str, int
         "max_q_range_width": max_q_range_width,
         "max_k_range_width": max_k_range_width,
     }
+
+    if range_count_deltas is not None:
+        running_range_count = 0
+        max_ranges_per_query = 0
+        queries_with_multiple_ranges = 0
+        for delta in range_count_deltas[:-1]:
+            running_range_count += delta
+            max_ranges_per_query = max(max_ranges_per_query, running_range_count)
+            if running_range_count > 1:
+                queries_with_multiple_ranges += 1
+        summary.update(
+            {
+                "max_ranges_per_query": max_ranges_per_query,
+                "queries_with_multiple_ranges": queries_with_multiple_ranges,
+            }
+        )
+    else:
+        summary.update(
+            {
+                "max_ranges_per_query": 0,
+                "queries_with_multiple_ranges": 0,
+            }
+        )
+
+    return summary
 
 
 def get_prefix_tree_runtime_skip_reason(
@@ -395,13 +434,34 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
     q_ranges: list[list[int]] = []
     k_ranges: list[list[int]] = []
     attn_type_map: list[int] = []
+    path_segments: list[tuple[int, int]] = []
+
+    def _push_path_segment(segment_start: int, segment_end: int) -> tuple[bool, int]:
+        if path_segments and path_segments[-1][1] == segment_start:
+            prev_start, prev_end = path_segments[-1]
+            path_segments[-1] = (prev_start, segment_end)
+            return True, prev_end
+
+        path_segments.append((segment_start, segment_end))
+        return False, -1
+
+    def _pop_path_segment(merged_with_previous: bool, previous_end: int) -> None:
+        if merged_with_previous:
+            prev_start, _ = path_segments[-1]
+            path_segments[-1] = (prev_start, previous_end)
+            return
+        path_segments.pop()
 
     local_root.index = -1
-    stack: list[tuple[_RuntimeTrieNode, tuple[tuple[int, int], ...]]] = [
-        (child, ()) for child in reversed(list(local_root.children.values()))
-    ]
+    stack: list[tuple[str, Any]] = [("visit", child) for child in reversed(list(local_root.children.values()))]
     while stack:
-        start_node, ancestor_chain_intervals = stack.pop()
+        action, payload = stack.pop()
+        if action == "restore_path":
+            merged_with_previous, previous_end = payload
+            _pop_path_segment(bool(merged_with_previous), int(previous_end))
+            continue
+
+        start_node = payload
 
         chain_nodes: list[_RuntimeTrieNode] = [start_node]
         chain_tail = start_node
@@ -416,22 +476,21 @@ def build_prefix_tree_batch_plan(tokens: Sequence[Sequence[int] | Any]) -> Prefi
             merged_position_ids.append(max(int(node.depth) - 1, 0))
         chain_end = len(merged_tokens)
 
-        chain_interval = (chain_start, chain_end)
-        merged_path_segments = _merge_contiguous_intervals([*ancestor_chain_intervals, chain_interval])
-        for segment_start, segment_end in merged_path_segments[:-1]:
+        merged_with_previous, previous_end = _push_path_segment(chain_start, chain_end)
+        for segment_start, segment_end in path_segments[:-1]:
             q_ranges.append([chain_start, chain_end])
             k_ranges.append([segment_start, segment_end])
             attn_type_map.append(0)
 
-        causal_start, causal_end = merged_path_segments[-1]
+        causal_start, causal_end = path_segments[-1]
         q_ranges.append([chain_start, chain_end])
         k_ranges.append([causal_start, causal_end])
         attn_type_map.append(1)
 
-        child_ancestor_intervals = (*ancestor_chain_intervals, chain_interval)
+        stack.append(("restore_path", (merged_with_previous, previous_end)))
         if chain_tail.children:
             for child in reversed(list(chain_tail.children.values())):
-                stack.append((child, child_ancestor_intervals))
+                stack.append(("visit", child))
 
     unmerge_index: list[int] = []
     for path in sample_paths:
