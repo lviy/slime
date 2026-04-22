@@ -784,6 +784,7 @@ class RolloutManager:
                 tokens=train_data["tokens"],
                 prefix_max_len=self.args.slime_prefix_max_len,
                 min_group_size=self.args.slime_prefix_min_group_size,
+                block_size=self.args.slime_prefix_runtime_block_size,
             )
             add_ptm_debug_timing(debug_timings, "rollout_ptm_metadata_build", ptm_metadata_start)
             train_data.update(ptm_metadata)
@@ -888,7 +889,11 @@ class RolloutManager:
                     step_sample_ids = list(range(local_start, local_end))
                     schedule_context_start = start_ptm_debug_timer()
                     step_schedule_contexts.append(
-                        build_prefix_tree_schedule_context(step_tokens, sample_ids=step_sample_ids)
+                        build_prefix_tree_schedule_context(
+                            step_tokens,
+                            sample_ids=step_sample_ids,
+                            block_size=self.args.slime_prefix_runtime_block_size,
+                        )
                     )
                     add_ptm_debug_timing(debug_timings, "rollout_ptm_schedule_context_build", schedule_context_start)
                     schedule_context_build_calls += 1

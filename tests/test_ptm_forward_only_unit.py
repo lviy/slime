@@ -453,6 +453,21 @@ def test_prefix_tree_schedule_context_lcp_matches_exact_prefix_lengths() -> None
 
 
 @pytest.mark.unit
+def test_prefix_tree_schedule_context_block_aligned_lcp() -> None:
+    token_lists = [
+        [1, 2, 3, 4, 11],
+        [1, 2, 3, 4, 12],
+        [1, 2, 3, 9, 10],
+    ]
+    schedule_ctx = build_prefix_tree_schedule_context(token_lists, sample_ids=[0, 1, 2], block_size=4)
+
+    assert schedule_ctx.block_size == 4
+    assert schedule_ctx.get_lcp(0, 1) == 4
+    assert schedule_ctx.get_lcp(0, 2) == 0
+    assert schedule_ctx.get_lcp(1, 2) == 0
+
+
+@pytest.mark.unit
 def test_prefix_tree_schedule_context_single_sample() -> None:
     schedule_ctx = build_prefix_tree_schedule_context([[101, 11, 12]], sample_ids=[7])
 
@@ -545,6 +560,24 @@ def test_prefix_tree_schedule_context_runtime_estimate_handles_padding_gate() ->
     assert estimate.num_merged_tokens == 5
     assert estimate.num_forward_tokens == 8
     assert estimate.num_forward_tokens >= estimate.num_input_tokens
+
+
+@pytest.mark.unit
+def test_prefix_tree_group_metadata_block_aligned_prefixes() -> None:
+    token_lists = [
+        [1, 2, 3, 4, 11],
+        [1, 2, 3, 4, 12],
+        [1, 2, 3, 9, 10],
+    ]
+
+    meta = build_prefix_group_metadata(token_lists, block_size=4, min_group_size=2)
+
+    assert meta["ptm_prefix_lens"] == [4, 4, 0]
+    assert meta["ptm_group_sizes"] == [2, 2, 1]
+    assert meta["ptm_num_mergeable_groups"] == 1
+    assert meta["ptm_num_mergeable_samples"] == 2
+    assert meta["ptm_group_ids"][0] == meta["ptm_group_ids"][1]
+    assert meta["ptm_group_ids"][2] == -1
 
 
 @pytest.mark.unit

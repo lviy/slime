@@ -635,7 +635,9 @@ class MegatronTrainRayActor(TrainRayActor):
             prefix_tree_context = None
             if self.args.slime_prefix_tree_merging:
                 prefix_tree_context = build_prefix_tree_context_from_rollout_data(
-                    rollout_data, min_group_size=self.args.slime_prefix_min_group_size
+                    rollout_data,
+                    min_group_size=self.args.slime_prefix_min_group_size,
+                    block_size=self.args.slime_prefix_runtime_block_size,
                 )
                 if prefix_tree_context is not None and is_megatron_main_rank() and is_ptm_debug_enabled():
                     log_prefix_tree_context("train_actor_build", prefix_tree_context)

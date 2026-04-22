@@ -76,7 +76,7 @@ def _as_int_list(tokens: Any) -> list[int]:
 @dataclass
 class _TrieNode:
     count: int
-    children: dict[int, "_TrieNode"]
+    children: dict[Any, "_TrieNode"]
 
     @staticmethod
     def new() -> "_TrieNode":
@@ -85,7 +85,7 @@ class _TrieNode:
 
 @dataclass
 class _ScheduleTrieNode:
-    children: dict[int, "_ScheduleTrieNode"]
+    children: dict[Any, "_ScheduleTrieNode"]
     terminal_sample_ids: list[int]
 
     @staticmethod
@@ -143,6 +143,7 @@ class PrefixTreeScheduleContext:
     adjacent_lcps: list[int]
     lcp_sparse_table: list[list[int]]
     lcp_log2: list[int]
+    block_size: int = 1
 
     @property
     def num_samples(self) -> int:
@@ -223,25 +224,48 @@ def _runtime_block_fingerprint(tokens: Sequence[int], start: int, block_size: in
     return value
 
 
-def _longest_common_prefix(seq_a: Sequence[int], seq_b: Sequence[int]) -> int:
+def _longest_common_prefix(seq_a: Sequence[Any], seq_b: Sequence[Any]) -> int:
     matched = 0
     for token_a, token_b in zip(seq_a, seq_b, strict=False):
-        if int(token_a) != int(token_b):
+        if token_a != token_b:
             break
         matched += 1
     return matched
 
 
+def _extract_block_key_sequence(
+    tokens: Sequence[int] | Any,
+    block_size: int,
+    *,
+    max_aligned_len: int | None = None,
+) -> list[tuple[int, ...]]:
+    seq = _as_int_list(tokens)
+    block_size = max(int(block_size), 1)
+    if block_size <= 1:
+        if max_aligned_len is None:
+            return [(int(token),) for token in seq]
+        return [(int(token),) for token in seq[: max(int(max_aligned_len), 0)]]
+
+    aligned_len = len(seq) if max_aligned_len is None else min(max(int(max_aligned_len), 0), len(seq))
+    aligned_len = _align_lcp_to_runtime_block(aligned_len, block_size)
+    return [tuple(seq[start : start + block_size]) for start in range(0, aligned_len, block_size)]
+
+
 def build_prefix_tree_schedule_context(
     tokens: Sequence[Sequence[int] | Any],
     sample_ids: Sequence[int] | None = None,
+    block_size: int = 1,
 ) -> PrefixTreeScheduleContext:
-    """Build an exact PTM schedule context for one local rollout step.
+    """Build a PTM schedule context for one local rollout step.
 
     The context is used by the PTM-aware dynamic batching planner. It constructs
     a single global trie for the step, emits samples in trie-derived lexicographic
     order, and precomputes RMQ over adjacent LCPs so bucket insertion costs can
     be updated exactly from predecessor/successor relationships.
+
+    When ``block_size > 1``, the trie and adjacent LCPs are built from full
+    aligned blocks only. This keeps scheduling consistent with runtime block PTM
+    while reducing Python-side trie size from token-level to block-level.
     """
 
     if sample_ids is None:
@@ -249,24 +273,27 @@ def build_prefix_tree_schedule_context(
     else:
         sample_ids = [int(sample_idx) for sample_idx in sample_ids]
 
+    block_size = max(int(block_size), 1)
+
     if len(tokens) != len(sample_ids):
         raise ValueError(f"tokens/sample_ids length mismatch: {len(tokens)} vs {len(sample_ids)}")
 
     root = _ScheduleTrieNode.root()
-    sequences_by_sample: dict[int, list[int]] = {}
+    sequences_by_sample: dict[int, list[tuple[int, ...]]] = {}
     sample_lengths: dict[int, int] = {}
 
     for sample_idx, seq_like in zip(sample_ids, tokens, strict=True):
         seq = _as_int_list(seq_like)
-        sequences_by_sample[sample_idx] = seq
         sample_lengths[sample_idx] = len(seq)
+        block_key_seq = _extract_block_key_sequence(seq, block_size)
+        sequences_by_sample[sample_idx] = block_key_seq
 
         node = root
-        for token in seq:
-            child = node.children.get(token)
+        for block_key in block_key_seq:
+            child = node.children.get(block_key)
             if child is None:
                 child = _ScheduleTrieNode(children={}, terminal_sample_ids=[])
-                node.children[int(token)] = child
+                node.children[block_key] = child
             node = child
         node.terminal_sample_ids.append(sample_idx)
 
@@ -285,10 +312,7 @@ def build_prefix_tree_schedule_context(
     adjacent_lcps: list[int] = []
     for prev_sample_idx, sample_idx in zip(rank_to_sample, rank_to_sample[1:]):
         adjacent_lcps.append(
-            _longest_common_prefix(
-                sequences_by_sample[prev_sample_idx],
-                sequences_by_sample[sample_idx],
-            )
+            _longest_common_prefix(sequences_by_sample[prev_sample_idx], sequences_by_sample[sample_idx]) * block_size
         )
 
     lcp_log2 = [0] * (len(adjacent_lcps) + 1)
@@ -314,6 +338,7 @@ def build_prefix_tree_schedule_context(
         adjacent_lcps=adjacent_lcps,
         lcp_sparse_table=lcp_sparse_table,
         lcp_log2=lcp_log2,
+        block_size=block_size,
     )
 
 
@@ -814,15 +839,21 @@ def build_prefix_group_metadata(
     response_lengths: Sequence[int] | None = None,
     prefix_max_len: int | None = None,
     min_group_size: int = 2,
+    block_size: int = 1,
 ) -> dict[str, Any]:
-    """Build per-sample PTM metadata from full-sequence prefix-tree matching.
+    """Build per-sample PTM metadata from prefix-tree matching.
 
     Each sample traverses a trie built from effective token sequences (without
     right-padding). Its reusable prefix length is the deepest depth whose trie
     node support count is at least ``min_group_size``.
+
+    When ``block_size > 1``, only full aligned blocks participate in grouping and
+    prefix length computation. Returned ``ptm_prefix_lens`` stay in token units,
+    but are aligned down to the block boundary.
     """
 
     n = len(tokens)
+    block_size = max(int(block_size), 1)
     if n == 0:
         return {
             "ptm_group_ids": [],
@@ -849,39 +880,39 @@ def build_prefix_group_metadata(
             f"tokens and effective_lengths length mismatch: {len(tokens)} vs {len(effective_lengths)}"
         )
 
-    clipped_sequences: list[list[int]] = []
+    clipped_sequences: list[list[tuple[int, ...]]] = []
     for tok, effective_len in zip(tokens, effective_lengths, strict=True):
         tok_list = _as_int_list(tok)
         capped_effective_len = max(min(int(effective_len), len(tok_list)), 0)
         cap_len = capped_effective_len if prefix_max_len is None else min(capped_effective_len, int(prefix_max_len))
-        clipped_sequences.append(tok_list[:cap_len])
+        clipped_sequences.append(_extract_block_key_sequence(tok_list, block_size, max_aligned_len=cap_len))
 
     root = _TrieNode.new()
     for seq in clipped_sequences:
         node = root
-        for token in seq:
-            child = node.children.get(token)
+        for block_key in seq:
+            child = node.children.get(block_key)
             if child is None:
                 child = _TrieNode.new()
-                node.children[token] = child
+                node.children[block_key] = child
             child.count += 1
             node = child
 
     prefix_lens: list[int] = [0] * n
-    groups_by_key: dict[tuple[int, ...], list[int]] = defaultdict(list)
+    groups_by_key: dict[tuple[tuple[int, ...], ...], list[int]] = defaultdict(list)
     for i, seq in enumerate(clipped_sequences):
         node = root
-        best_depth = 0
-        for depth, token in enumerate(seq, start=1):
-            child = node.children.get(token)
+        best_depth_blocks = 0
+        for depth_blocks, block_key in enumerate(seq, start=1):
+            child = node.children.get(block_key)
             if child is None:
                 break
             if child.count >= min_group_size:
-                best_depth = depth
+                best_depth_blocks = depth_blocks
             node = child
-        prefix_lens[i] = best_depth
-        if best_depth > 0:
-            groups_by_key[tuple(seq[:best_depth])].append(i)
+        prefix_lens[i] = best_depth_blocks * block_size
+        if best_depth_blocks > 0:
+            groups_by_key[tuple(seq[:best_depth_blocks])].append(i)
 
     group_ids: list[int] = [-1] * n
     group_sizes: list[int] = [1] * n
@@ -922,6 +953,7 @@ def build_prefix_group_metadata(
 def build_prefix_tree_context_from_rollout_data(
     rollout_data: dict[str, Any],
     min_group_size: int = 2,
+    block_size: int = 1,
 ) -> PrefixTreeMergingContext | None:
     """Build local-rank PTM context from rollout_data.
 
@@ -937,7 +969,12 @@ def build_prefix_tree_context_from_rollout_data(
         effective_lengths = rollout_data.get("total_lengths")
         if tokens is None:
             return None
-        fallback = build_prefix_group_metadata(tokens, effective_lengths=effective_lengths, min_group_size=min_group_size)
+        fallback = build_prefix_group_metadata(
+            tokens,
+            effective_lengths=effective_lengths,
+            min_group_size=min_group_size,
+            block_size=block_size,
+        )
         group_ids = fallback["ptm_group_ids"]
         prefix_lens = fallback["ptm_prefix_lens"]
 
