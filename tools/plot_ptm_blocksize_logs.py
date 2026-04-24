@@ -18,9 +18,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-PERF_RE = re.compile(r"perf\s+\d+:\s+(\{.*\})")
+ACTOR_PERF_RE = re.compile(r"train_metric_utils\.py:\d+\s+-\s+perf\s+\d+:\s+(\{.*\})")
+ROLLOUT_PERF_RE = re.compile(r"\[PTMDebug\]\s+rollout perf\s+\d+:\s+(\{.*\})")
 DRIVER_PERF_RE = re.compile(r"\[PTMDebug\]\s+driver perf\s+\d+:\s+(\{.*\})")
-SUMMARY_RE = re.compile(r"^(ptm_off|ptm_on|comparison):\s+(\{.*\})\s*$")
+SUMMARY_RE = re.compile(r"^(ptm_off|ptm_on|comparison):\s+(\{.*\})\s*$", re.MULTILINE)
 BLOCKSIZE_IN_LOG_RE = re.compile(r"slime-prefix-runtime-block-size\s+(\d+)")
 RUNTIME_BLOCKSIZE_RE = re.compile(r"runtime_block_size=(\d+)")
 BLOCKSIZE_IN_PATH_RE = re.compile(r"(?:block(?:size)?|bs)[=_-]?(\d+)", re.IGNORECASE)
@@ -43,7 +44,8 @@ DEFAULT_STAGE_METRICS = [
 class ParsedLog:
     block_size: int
     path: Path
-    perf: dict[str, float]
+    actor_perf: dict[str, float]
+    rollout_perf: dict[str, float]
     driver_perf: dict[str, float]
     summary: dict[str, dict[str, Any]]
 
@@ -63,19 +65,23 @@ def _coerce_float_dict(data: dict[str, Any]) -> dict[str, float]:
     return out
 
 
-def _extract_last_dicts(text: str) -> tuple[dict[str, float], dict[str, float], dict[str, dict[str, Any]]]:
-    perf_matches = PERF_RE.findall(text)
+def _extract_last_dicts(
+    text: str,
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, dict[str, Any]]]:
+    actor_perf_matches = ACTOR_PERF_RE.findall(text)
+    rollout_perf_matches = ROLLOUT_PERF_RE.findall(text)
     driver_matches = DRIVER_PERF_RE.findall(text)
     summary_matches = SUMMARY_RE.findall(text)
 
-    perf = _coerce_float_dict(_safe_literal_eval_dict(perf_matches[-1])) if perf_matches else {}
+    actor_perf = _coerce_float_dict(_safe_literal_eval_dict(actor_perf_matches[-1])) if actor_perf_matches else {}
+    rollout_perf = _coerce_float_dict(_safe_literal_eval_dict(rollout_perf_matches[-1])) if rollout_perf_matches else {}
     driver_perf = _coerce_float_dict(_safe_literal_eval_dict(driver_matches[-1])) if driver_matches else {}
 
     summary: dict[str, dict[str, Any]] = {}
     for label, raw_dict in summary_matches:
         summary[label] = _safe_literal_eval_dict(raw_dict)
 
-    return perf, driver_perf, summary
+    return actor_perf, rollout_perf, driver_perf, summary
 
 
 def _infer_block_size_from_text(text: str, path: Path) -> int:
@@ -98,9 +104,16 @@ def _infer_block_size_from_text(text: str, path: Path) -> int:
 
 def parse_one_log(path: Path, explicit_block_size: int | None = None) -> ParsedLog:
     text = path.read_text(encoding="utf-8", errors="replace")
-    perf, driver_perf, summary = _extract_last_dicts(text)
+    actor_perf, rollout_perf, driver_perf, summary = _extract_last_dicts(text)
     block_size = explicit_block_size if explicit_block_size is not None else _infer_block_size_from_text(text, path)
-    return ParsedLog(block_size=block_size, path=path, perf=perf, driver_perf=driver_perf, summary=summary)
+    return ParsedLog(
+        block_size=block_size,
+        path=path,
+        actor_perf=actor_perf,
+        rollout_perf=rollout_perf,
+        driver_perf=driver_perf,
+        summary=summary,
+    )
 
 
 def _build_combined_metric_row(parsed: ParsedLog, metrics: list[str]) -> dict[str, Any]:
@@ -110,7 +123,9 @@ def _build_combined_metric_row(parsed: ParsedLog, metrics: list[str]) -> dict[st
     }
 
     for metric in metrics:
-        value = parsed.perf.get(metric)
+        value = parsed.actor_perf.get(metric)
+        if value is None:
+            value = parsed.rollout_perf.get(metric)
         if value is None:
             value = parsed.driver_perf.get(metric)
         row[metric] = value
