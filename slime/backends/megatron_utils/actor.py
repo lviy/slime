@@ -618,23 +618,94 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             # Reuse the PTM-aware logprob micro-batch schedule for actor_train. The
             # runtime merged tokens/ranges are still rebuilt per forward in get_batch().
+            # Keep train chunks bounded by the original token budget because loss/CE is
+            # still computed on unmerged logits after PTM unmerge.
             train_iterator_start_time = perf_counter()
-            data_iterator = [
-                DataIterator(
-                    rollout_data,
-                    iterator.micro_batch_size,
-                    [list(indices) for indices in iterator.micro_batch_indices]
-                    if iterator.micro_batch_indices is not None
-                    else None,
+            logprob_micro_batch_indices = logprob_data_iterator[0].micro_batch_indices
+            train_micro_batch_indices = None
+            if logprob_micro_batch_indices is not None and self.args.max_tokens_per_gpu is not None:
+                token_budget = int(self.args.max_tokens_per_gpu) * mpu.get_context_parallel_world_size()
+                total_lengths = rollout_data["total_lengths"]
+                step_train_partitions = []
+                offset = 0
+                for step_num_microbatches in logprob_num_microbatches:
+                    step_partitions_for_train = []
+                    step_partitions = logprob_micro_batch_indices[offset : offset + step_num_microbatches]
+                    offset += step_num_microbatches
+                    for partition in step_partitions:
+                        current_partition = []
+                        current_tokens = 0
+                        for sample_idx in partition:
+                            sample_idx = int(sample_idx)
+                            sample_tokens = int(total_lengths[sample_idx])
+                            if current_partition and current_tokens + sample_tokens > token_budget:
+                                step_partitions_for_train.append(current_partition)
+                                current_partition = []
+                                current_tokens = 0
+                            current_partition.append(sample_idx)
+                            current_tokens += sample_tokens
+                        if current_partition:
+                            step_partitions_for_train.append(current_partition)
+                    step_train_partitions.append(step_partitions_for_train)
+
+                num_microbatches_tensor = torch.tensor(
+                    [len(partitions) for partitions in step_train_partitions],
+                    dtype=torch.int,
+                    device=torch.cuda.current_device(),
                 )
-                for iterator in logprob_data_iterator
-            ]
-            num_microbatches = list(logprob_num_microbatches)
+                dist.all_reduce(num_microbatches_tensor, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group())
+                num_microbatches = num_microbatches_tensor.tolist()
+
+                for step_idx, target_num_microbatches in enumerate(num_microbatches):
+                    partitions = step_train_partitions[step_idx]
+                    while len(partitions) < target_num_microbatches:
+                        split_idx = max(
+                            range(len(partitions)),
+                            key=lambda idx: (len(partitions[idx]), sum(int(total_lengths[i]) for i in partitions[idx])),
+                        )
+                        partition = partitions.pop(split_idx)
+                        if len(partition) <= 1:
+                            partitions.insert(split_idx, partition)
+                            raise RuntimeError(
+                                "Cannot split PTM actor_train micro-batches to match DP-wide schedule count."
+                            )
+                        left_partition = []
+                        right_partition = []
+                        left_tokens = 0
+                        right_tokens = 0
+                        for sample_idx in partition:
+                            if left_tokens <= right_tokens:
+                                left_partition.append(sample_idx)
+                                left_tokens += int(total_lengths[sample_idx])
+                            else:
+                                right_partition.append(sample_idx)
+                                right_tokens += int(total_lengths[sample_idx])
+                        partitions[split_idx:split_idx] = [left_partition, right_partition]
+
+                train_micro_batch_indices = [
+                    partition for step_partitions in step_train_partitions for partition in step_partitions
+                ]
+            else:
+                num_microbatches = list(logprob_num_microbatches)
+
+            if train_micro_batch_indices is None:
+                data_iterator = [
+                    DataIterator(
+                        rollout_data,
+                        iterator.micro_batch_size,
+                        [list(indices) for indices in iterator.micro_batch_indices]
+                        if iterator.micro_batch_indices is not None
+                        else None,
+                    )
+                    for iterator in logprob_data_iterator
+                ]
+            else:
+                data_iterator = [DataIterator(rollout_data, None, train_micro_batch_indices) for _ in logprob_data_iterator]
             Timer().add("actor_train_data_iterator_time", perf_counter() - train_iterator_start_time)
             if is_megatron_main_rank():
                 logger.info(
                     "Using PTM-aware dynamic batching for no-grad logprob and actor_train; "
-                    "actor_train reuses the logprob micro-batch schedule."
+                    "actor_train reuses the logprob micro-batch order with original-token budget splits."
                 )
         else:
             # Create data iterator for training.
