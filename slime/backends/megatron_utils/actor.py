@@ -724,6 +724,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     data_iterator,
                     num_microbatches,
+                    prefix_tree_context=prefix_tree_context,
+                    prefix_tree_stage="actor-train",
                 )
 
             self.prof.step(rollout_id=rollout_id)
