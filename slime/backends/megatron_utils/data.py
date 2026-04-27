@@ -809,6 +809,7 @@ def get_data_iterator(
         assert len(samples) == num_local_samples
         token_budget = args.max_tokens_per_gpu * cp_size
         num_microbatches = []
+        original_num_microbatches = []
         ptm_sched_first_pass_elapsed = 0.0
         ptm_sched_second_pass_elapsed = 0.0
         first_pass_partitions: list[list[list[int]] | None] = [None] * num_steps_per_rollout
@@ -816,6 +817,7 @@ def get_data_iterator(
         first_pass_start_time = perf_counter() if ptm_debug_enabled else None
         for i in range(num_steps_per_rollout):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+            original_num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], token_budget))
             if use_ptm_sched:
                 step_indices = list(range(start, end))
                 if step_schedule_contexts is None or i >= len(step_schedule_contexts):
@@ -830,21 +832,30 @@ def get_data_iterator(
                 first_pass_partitions[i] = step_partitions
                 num_microbatches.append(len(step_partitions))
             else:
-                num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], token_budget))
+                num_microbatches.append(original_num_microbatches[-1])
         if ptm_debug_enabled and first_pass_start_time is not None:
             ptm_sched_first_pass_elapsed = perf_counter() - first_pass_start_time
 
         sync_start_time = perf_counter()
+        original_num_microbatches = torch.tensor(
+            original_num_microbatches, dtype=torch.int, device=torch.cuda.current_device()
+        )
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
+        dist.all_reduce(original_num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
         dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
 
         if vpp_size > 1:
             # vpp requies the number of microbatches to be divisible by vpp_size
+            original_num_microbatches = torch.clamp(
+                original_num_microbatches // microbatch_group_size_per_vp_stage * microbatch_group_size_per_vp_stage,
+                min=1,
+            )
             num_microbatches = torch.clamp(
                 num_microbatches // microbatch_group_size_per_vp_stage * microbatch_group_size_per_vp_stage,
                 min=1,
             )
 
+        original_num_microbatches = original_num_microbatches.tolist()
         num_microbatches = num_microbatches.tolist()
         sync_elapsed = perf_counter() - sync_start_time
 
@@ -887,13 +898,16 @@ def get_data_iterator(
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
-        if use_ptm_sched and ptm_debug_enabled:
-            total_ptm_sched_time = ptm_sched_first_pass_elapsed + ptm_sched_second_pass_elapsed
-            _add_timing(f"{timer_prefix}_ptm_sched", total_ptm_sched_time)
-            _add_timing(f"{timer_prefix}_ptm_sched_first_pass", ptm_sched_first_pass_elapsed)
-            _add_timing(f"{timer_prefix}_ptm_sched_second_pass", ptm_sched_second_pass_elapsed)
-            _add_timing(f"{timer_prefix}_ptm_sched_estimate", float(ptm_sched_metrics["estimate_time_s"]))
+        total_original_microbatches = int(sum(original_num_microbatches))
+        total_ptm_microbatches = int(sum(num_microbatches))
+        batch_reduction_ratio = (
+            total_original_microbatches / total_ptm_microbatches if total_ptm_microbatches > 0 else 0.0
+        )
+        _add_timing(f"{timer_prefix}_original_microbatches", float(total_original_microbatches))
+        _add_timing(f"{timer_prefix}_ptm_microbatches", float(total_ptm_microbatches))
+        _add_timing(f"{timer_prefix}_batch_reduction_ratio", batch_reduction_ratio)
 
+        if use_ptm_sched and ptm_debug_enabled:
             if _should_log_schedule_details():
                 logger.info(
                     "[PTMScheduler] stage=%s steps=%d token_budget=%d "
@@ -901,7 +915,9 @@ def get_data_iterator(
                     "first_pass_time_s=%.3f second_pass_time_s=%.3f sync_time_s=%.3f "
                     "estimate_time_s=%.3f estimate_calls=%d estimate_cache_hits=%d "
                     "estimate_cache_misses=%d candidate_evals=%d build_calls=%d "
-                    "reused_first_pass_steps=%d/%d local_num_microbatches=%s final_num_microbatches=%s",
+                    "reused_first_pass_steps=%d/%d original_num_microbatches=%s "
+                    "ptm_num_microbatches=%s total_original_microbatches=%d "
+                    "total_ptm_microbatches=%d batch_reduction_ratio=%.3f",
                     timer_prefix or "data_iterator",
                     num_steps_per_rollout,
                     token_budget,
@@ -917,8 +933,11 @@ def get_data_iterator(
                     int(ptm_sched_metrics["build_calls"]),
                     int(ptm_sched_metrics["reused_first_pass_steps"]),
                     num_steps_per_rollout,
-                    [len(p) if p is not None else 0 for p in first_pass_partitions],
+                    original_num_microbatches,
                     num_microbatches,
+                    total_original_microbatches,
+                    total_ptm_microbatches,
+                    batch_reduction_ratio,
                 )
         _add_timing(f"{timer_prefix}_microbatch_sync", sync_elapsed)
 

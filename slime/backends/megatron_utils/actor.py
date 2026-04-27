@@ -631,6 +631,17 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
             num_microbatches = list(logprob_num_microbatches)
             Timer().add("actor_train_data_iterator_time", perf_counter() - train_iterator_start_time)
+            timer_values = Timer().log_dict()
+            for metric_suffix in (
+                "original_microbatches",
+                "ptm_microbatches",
+                "batch_reduction_ratio",
+                "microbatch_sync",
+            ):
+                logprob_metric = f"actor_logprob_data_iterator_{metric_suffix}"
+                train_metric = f"actor_train_data_iterator_{metric_suffix}"
+                if logprob_metric in timer_values:
+                    Timer().add(train_metric, timer_values[logprob_metric])
             if is_megatron_main_rank():
                 logger.info(
                     "Using PTM-aware dynamic batching for no-grad logprob and actor_train; "
