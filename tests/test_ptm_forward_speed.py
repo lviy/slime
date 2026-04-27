@@ -225,6 +225,12 @@ def build_parser() -> ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--log-probs-chunk-size",
+        type=int,
+        default=None,
+        help="Optional --log-probs-chunk-size forwarded to train.py for chunked CE/logprob memory reduction.",
+    )
+    parser.add_argument(
         "--slime-prefix-runtime-block-size",
         type=int,
         default=PTM_RUNTIME_BLOCK_SIZE,
@@ -448,6 +454,7 @@ def _common_args(
     max_tokens_per_gpu: int,
     decoder_last_pipeline_num_layers: int | None,
     train_memory_margin_bytes: int | None,
+    log_probs_chunk_size: int | None,
 ) -> str:
     ckpt_args = f"--hf-checkpoint {model_path} " f"--ref-load {ref_load} "
 
@@ -504,6 +511,8 @@ def _common_args(
     )
     if train_memory_margin_bytes is not None:
         misc_args += f"--train-memory-margin-bytes {train_memory_margin_bytes} "
+    if log_probs_chunk_size is not None:
+        misc_args += f"--log-probs-chunk-size {log_probs_chunk_size} "
 
     return f"{ckpt_args} " f"{rollout_args} " f"{optimizer_args} " f"{grpo_args} " f"{perf_args} " f"{misc_args} "
 
@@ -609,6 +618,7 @@ def execute_phase3_only(
     max_tokens_per_gpu: int,
     decoder_last_pipeline_num_layers: int | None,
     train_memory_margin_bytes: int | None,
+    log_probs_chunk_size: int | None,
     slime_prefix_runtime_block_size: int,
     ptm_enabled: bool,
     save_dir: str,
@@ -624,7 +634,7 @@ def execute_phase3_only(
             "Please provide either a {rollout_id} template or an indexed path such as rollout_0.pt."
         )
     phase_args = (
-        f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode, tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size, expert_model_parallel_size, expert_tensor_parallel_size, max_tokens_per_gpu, decoder_last_pipeline_num_layers, train_memory_margin_bytes)} "
+        f"{_common_args(num_rollout, num_gpus, model_path, ref_load, megatron_to_hf_mode, tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size, expert_model_parallel_size, expert_tensor_parallel_size, max_tokens_per_gpu, decoder_last_pipeline_num_layers, train_memory_margin_bytes, log_probs_chunk_size)} "
         f"--load-debug-rollout-data {resolved_rollout_pt} "
     )
     if ci_test:
@@ -744,6 +754,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 max_tokens_per_gpu=args.max_tokens_per_gpu,
                 decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
                 train_memory_margin_bytes=args.train_memory_margin_bytes,
+                log_probs_chunk_size=args.log_probs_chunk_size,
                 slime_prefix_runtime_block_size=args.slime_prefix_runtime_block_size,
                 ptm_enabled=ptm_enabled,
                 save_dir=save_dir,
@@ -784,6 +795,7 @@ def run_benchmark(args, model_cfg: dict[str, str | None], save_dir: str) -> dict
                 max_tokens_per_gpu=args.max_tokens_per_gpu,
                 decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
                 train_memory_margin_bytes=args.train_memory_margin_bytes,
+                log_probs_chunk_size=args.log_probs_chunk_size,
                 slime_prefix_runtime_block_size=args.slime_prefix_runtime_block_size,
                 ptm_enabled=ptm_enabled,
                 save_dir=save_dir,
