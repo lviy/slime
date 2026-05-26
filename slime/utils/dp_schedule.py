@@ -70,6 +70,7 @@ def build_dp_schedule(
     *,
     global_batch_size: int,
     rollout_indices: list[int],
+    max_tokens_per_gpu: int | None = None,
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
     """Compute the per-rank DP partition and micro-batch schedule.
 
@@ -87,6 +88,8 @@ def build_dp_schedule(
             samples don't fit are dropped.
         rollout_indices: rollout id for each sample (``samples[i].index``).
             Samples sharing the same id are kept together in one step.
+        max_tokens_per_gpu: Optional override for the dynamic-batch token cap.
+            Falls back to ``args.max_tokens_per_gpu`` when omitted.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
@@ -100,8 +103,11 @@ def build_dp_schedule(
 
     max_per_bin = None
     if args.use_dynamic_batch_size:
-        assert args.max_tokens_per_gpu is not None
-        max_per_bin = args.max_tokens_per_gpu * cp_size
+        effective_max_tokens_per_gpu = max_tokens_per_gpu
+        if effective_max_tokens_per_gpu is None:
+            effective_max_tokens_per_gpu = args.max_tokens_per_gpu
+        assert effective_max_tokens_per_gpu is not None
+        max_per_bin = effective_max_tokens_per_gpu * cp_size
 
     # mbs count per step must be divisible by (dp_size * mb_group_for_vpp) so
     # every rank ends up with the same num_mbs and (for VPP) the per-rank mbs
@@ -189,3 +195,51 @@ def build_dp_schedule(
                 micro_batch_indices[r].append(list(range(local_start, local_start + len(mbs_locals))))
 
     return partitions, micro_batch_indices, num_microbatches, global_batch_sizes
+
+
+def build_log_prob_schedule(
+    args: Any,
+    train_parallel_config: dict,
+    partitions: list[list[int]],
+    train_micro_batch_indices: list[list[list[int]]],
+    train_num_microbatches: list[int],
+    total_lengths: list[int],
+    *,
+    max_tokens_per_gpu: int | None = None,
+) -> tuple[list[list[list[int]]], list[int]]:
+    """Build a log-prob-only micro-batch schedule on top of the training partition."""
+    if not args.use_dynamic_batch_size:
+        return train_micro_batch_indices, train_num_microbatches
+
+    cp_size = train_parallel_config["cp_size"]
+    effective_max_tokens_per_gpu = max_tokens_per_gpu
+    if effective_max_tokens_per_gpu is None:
+        effective_max_tokens_per_gpu = args.max_tokens_per_gpu
+    assert effective_max_tokens_per_gpu is not None
+    max_per_bin = effective_max_tokens_per_gpu * cp_size
+
+    log_prob_micro_batch_indices: list[list[list[int]]] = [[] for _ in range(len(partitions))]
+    log_prob_num_microbatches: list[int] = []
+
+    step_cursors = [0] * len(partitions)
+    for step_id, step_num_microbatches in enumerate(train_num_microbatches):
+        step_rank_bins: list[tuple[list[int], list[list[int]], list[int]]] = []
+        target_nmb = 0
+        for r, partition in enumerate(partitions):
+            step_mbs = train_micro_batch_indices[r][step_cursors[r] : step_cursors[r] + step_num_microbatches]
+            step_cursors[r] += step_num_microbatches
+            step_local_indices = [idx for mbs in step_mbs for idx in mbs]
+            step_lengths = [total_lengths[partition[idx]] for idx in step_local_indices]
+            step_bins = first_fit_pack(step_lengths, max_per_bin)
+            step_rank_bins.append((step_local_indices, step_bins, step_lengths))
+            target_nmb = max(target_nmb, len(step_bins))
+
+        for r, (step_local_indices, step_bins, step_lengths) in enumerate(step_rank_bins):
+            if len(step_bins) != target_nmb:
+                expand_bins_by_splitting(step_bins, target_nmb, step_lengths)
+                assert len(step_bins) == target_nmb
+            log_prob_micro_batch_indices[r].extend([[step_local_indices[i] for i in bin_] for bin_ in step_bins])
+
+        log_prob_num_microbatches.append(target_nmb)
+
+    return log_prob_micro_batch_indices, log_prob_num_microbatches

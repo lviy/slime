@@ -18,7 +18,7 @@ from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupCo
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, build_log_prob_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
@@ -772,12 +772,22 @@ class RolloutManager:
             rollout_indices=data["rollout_ids"],
         )
 
+        log_prob_micro_batch_indices, log_prob_num_microbatches = build_log_prob_schedule(
+            self.args,
+            self.train_parallel_config,
+            partitions,
+            micro_batch_indices,
+            num_microbatches,
+            total_lengths,
+            max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
+        )
+
         # Package per-rank rollout_data
         rollout_data_refs = []
         for r in range(dp_size):
             partition = partitions[r]
             rollout_data = {"partition": partition}
-            for key in [
+            per_sample_keys = [
                 "tokens",
                 "multimodal_train_inputs",
                 "response_lengths",
@@ -792,7 +802,8 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
-            ]:
+            ]
+            for key in per_sample_keys:
                 if key not in data:
                     continue
                 rollout_data[key] = [data[key][j] for j in partition]
@@ -804,6 +815,9 @@ class RolloutManager:
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
+            if log_prob_micro_batch_indices != micro_batch_indices:
+                rollout_data["log_prob_num_microbatches"] = log_prob_num_microbatches
+                rollout_data["log_prob_micro_batch_indices"] = log_prob_micro_batch_indices[r]
             rollout_data_refs.append(Box(ray.put(rollout_data)))
         return rollout_data_refs
 

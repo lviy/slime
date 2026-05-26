@@ -251,10 +251,17 @@ class DataIterator:
         return self
 
 
-def get_data_iterator(rollout_data: RolloutBatch) -> list[DataIterator]:
-    """Build one ``DataIterator`` per VPP stage from the pre-computed schedule in ``rollout_data``."""
+def get_data_iterator(rollout_data: RolloutBatch, schedule_prefix: str = "") -> list[DataIterator]:
+    """Build one ``DataIterator`` per VPP stage from the pre-computed schedule in ``rollout_data``.
+
+    Args:
+        rollout_data: Per-rank rollout batch.
+        schedule_prefix: Optional schedule namespace prefix. ``""`` selects the
+            training schedule, while e.g. ``"log_prob_"`` selects the
+            corresponding prefixed schedule fields.
+    """
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
-    micro_batch_indices = rollout_data["micro_batch_indices"]
+    micro_batch_indices = rollout_data[f"{schedule_prefix}micro_batch_indices"]
     return [DataIterator(rollout_data, micro_batch_indices) for _ in range(vpp_size)]
 
 
@@ -303,6 +310,9 @@ def log_rollout_data(
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
+                "log_prob_global_batch_sizes",
+                "log_prob_num_microbatches",
+                "log_prob_micro_batch_indices",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

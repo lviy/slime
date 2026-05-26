@@ -212,6 +212,50 @@ def test_dynamic_with_vpp_rounds_to_mb_group():
 
 
 @pytest.mark.unit
+def test_dynamic_override_max_tokens_per_gpu_changes_schedule_without_mutating_default():
+    """An explicit override should only affect the derived schedule that asks for it."""
+    total_lengths = [8] * 8
+    rollout_indices = list(range(8))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=16)
+    tp = make_tp(dp_size=2)
+
+    default_partitions, default_mbi, default_nmb, default_gbs = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=8, rollout_indices=rollout_indices
+    )
+    override_partitions, override_mbi, override_nmb, override_gbs = build_dp_schedule(
+        args,
+        tp,
+        total_lengths,
+        global_batch_size=8,
+        rollout_indices=rollout_indices,
+        max_tokens_per_gpu=8,
+    )
+
+    assert default_gbs == override_gbs == [8]
+    assert default_nmb == [2]
+    assert override_nmb == [4]
+    assert default_mbi != override_mbi
+    assert_invariants(
+        default_partitions,
+        default_mbi,
+        default_nmb,
+        dp_size=2,
+        expected_global_sample_indices=range(8),
+        total_lengths=total_lengths,
+        max_per_bin=16,
+    )
+    assert_invariants(
+        override_partitions,
+        override_mbi,
+        override_nmb,
+        dp_size=2,
+        expected_global_sample_indices=range(8),
+        total_lengths=total_lengths,
+        max_per_bin=8,
+    )
+
+
+@pytest.mark.unit
 def test_rollout_grouping_keeps_samples_together():
     """compact / subagent simulation: rollout 0 emits 3 samples, rollout 1 emits 2,
     rollout 2 emits 4. Splitter keeps every rollout's samples in a single step."""
