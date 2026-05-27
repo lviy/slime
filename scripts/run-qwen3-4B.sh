@@ -35,28 +35,27 @@ fi
 echo "NUM_GPUS: $NUM_GPUS"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-4B.sh"
+source "${SCRIPT_DIR}/models/qwen3-8B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-4B
+   --hf-checkpoint /gfs/platform/public/infra/Qwen3-8B
    #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /root/Qwen3-4B_torch_dist
-   --load /root/Qwen3-4B_slime/
-   --save /root/Qwen3-4B_slime/
+   --ref-load /gfs/platform/public/infra/Qwen3-8B_torch_dist
+   --load /gfs/platform/public/infra/lxr/Slime-feat
+   --save /gfs/platform/public/infra/lxr/Slime-feat
    --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
-   --input-key prompt
-   --label-key label
+   --prompt-data /gfs/space/chatrl/users/hxh/data/slime_rl_data/math_verify_aime2024_sample32_no_prompt.jsonl
+   --input-key messages
+   --label-key answer
    --apply-chat-template
-   --rollout-shuffle
-   --rm-type deepscaler
-   --num-rollout 3000
-   --rollout-batch-size 32
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rm-type math
+   --num-rollout 5
+   --rollout-batch-size 256
+   --n-samples-per-prompt 16
+   --rollout-max-response-len 18192
    --rollout-temperature 1
 
    --global-batch-size 256
@@ -65,16 +64,16 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
+   --eval-prompt-data aime /gfs/space/chatrl/users/hxh/data/rule_based_rl/AIME-2024/data/AIME_DAPO_math.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
    --eval-top-p 1
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 1
+   --pipeline-model-parallel-size 2
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
@@ -85,7 +84,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 16192
 )
 
 GRPO_ARGS=(
@@ -115,7 +114,7 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 8
    --sglang-mem-fraction-static 0.7
 )
 
@@ -126,6 +125,7 @@ MISC_ARGS=(
    # should be good for model performance
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
+   #--debug-rollout-only
    # need to comment this when using model with MLA
    --attention-backend flash
 )
@@ -137,7 +137,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disab
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/\",
+    \"PYTHONPATH\": \"/gfs/platform/public/infra/lxr/sglang/python:/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
@@ -158,4 +158,5 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]}
+   ${MISC_ARGS[@]} \
+   "$@"
