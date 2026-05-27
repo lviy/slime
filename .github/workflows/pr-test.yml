@@ -288,7 +288,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        info: [{"num_gpus": 8, "test_file": "test_qwen3_0.6B_parallel_check.py"}]
+        info: [{"num_gpus": 8, "test_file": "test_qwen3_0.6B_parallel_check.py"}, {"num_gpus": 8, "test_file": "test_qwen3_0.6B_parallel_check_logprob_cap.py"}]
     defaults:
       run:
         working-directory: ${{ github.workspace }}
